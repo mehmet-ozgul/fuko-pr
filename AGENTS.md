@@ -33,8 +33,10 @@ endpoint, configured by `FUKO_EMBED_*` in the environment and nowhere else
   `get_pool`'s lock (#217): the best-effort state paths share that pool and must
   never queue behind a re-embed.
 - **Embeddings are provider-agnostic.** z.ai exposes no `/embeddings` endpoint, so
-  embeddings always go through an OpenAI-compatible HTTP endpoint. Chat (PR-Agent)
-  is configured separately.
+  embeddings go through an OpenAI-compatible HTTP endpoint by default; the one
+  exception is `FUKO_EMBED_PROVIDER=vertex`, Vertex AI's native `:predict`
+  (its OpenAI-compatible endpoint serves no embeddings). Chat (PR-Agent) is
+  configured separately.
 - **HTML lives in `sidecar/web/`.** Browser-facing pages are served under `/ui` by
   that package; no other module builds HTML. Adding one is a registry entry plus a
   module — the pattern and its conventions (route fetches and degrades, render

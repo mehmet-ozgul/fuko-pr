@@ -1,4 +1,9 @@
-"""OpenAI-compatible embeddings client (default: a local Ollama model)."""
+"""Embeddings client: OpenAI-compatible (default: a local Ollama model) or Vertex AI.
+
+``FUKO_EMBED_PROVIDER`` picks the wire protocol; everything above the
+transport -- batching, truncation, the dimension probe, the store's re-embed on
+a model change -- is shared. See :attr:`sidecar.config.Settings.embed_provider`.
+"""
 
 import httpx
 
@@ -22,25 +27,81 @@ def _fit(text: str) -> str:
     return text[: settings.embed_max_chars]
 
 
+#: Vertex ``task_type`` for the two sides of retrieval.
+_DOCUMENT = "RETRIEVAL_DOCUMENT"
+_QUERY = "RETRIEVAL_QUERY"
+
+
+def _vertex_url() -> str:
+    """The ``:predict`` URL for the configured Vertex model, project and location."""
+    location = settings.embed_vertex_location
+    host = (
+        "aiplatform.googleapis.com"
+        if location == "global"
+        else f"{location}-aiplatform.googleapis.com"
+    )
+    return (
+        f"https://{host}/v1/projects/{settings.embed_vertex_project}/locations/{location}"
+        f"/publishers/google/models/{settings.embed_model}:predict"
+    )
+
+
 class Embedder:
-    """Embed text via an OpenAI-compatible ``/embeddings`` endpoint."""
+    """Embed text via an OpenAI-compatible ``/embeddings`` endpoint or Vertex AI."""
 
     def __init__(self) -> None:
-        """Configure the endpoint URL, auth header, and HTTP client."""
+        """Configure the endpoint URL, auth, and HTTP client for the configured provider."""
         self._client = httpx.Client(timeout=120.0)
         self._dim: int | None = None
-        self._url = f"{settings.embed_base_url.rstrip('/')}/embeddings"
+        self._vertex = settings.embed_provider == "vertex"
         self._headers = {"Content-Type": "application/json"}
-        if settings.embed_api_key:
-            self._headers["Authorization"] = f"Bearer {settings.embed_api_key}"
+        self._tokens = None
+        if self._vertex:
+            if not settings.embed_vertex_project:
+                raise EmbedError("FUKO_EMBED_PROVIDER=vertex needs FUKO_EMBED_VERTEX_PROJECT")
+            # Lazy: an OpenAI-compatible deployment never touches Google auth.
+            from .reviewer.gcp_token import SourceTokenCache
 
-    def embed(self, texts: list[str]) -> list[list[float]]:
+            self._tokens = SourceTokenCache()
+            self._url = _vertex_url()
+        else:
+            self._url = f"{settings.embed_base_url.rstrip('/')}/embeddings"
+            if settings.embed_api_key:
+                self._headers["Authorization"] = f"Bearer {settings.embed_api_key}"
+
+    def _request(self, batch: list[str], task: str) -> tuple[dict, dict]:
+        """Headers and JSON body for one batch, in the provider's dialect."""
+        if not self._vertex:
+            return self._headers, {"model": settings.embed_model, "input": batch}
+        body: dict = {"instances": [{"content": t, "task_type": task} for t in batch]}
+        if settings.embed_dimensions:
+            body["parameters"] = {"outputDimensionality": settings.embed_dimensions}
+        headers = {**self._headers, "Authorization": f"Bearer {self._tokens.bearer()}"}
+        return headers, body
+
+    def _vectors(self, payload: dict) -> list[list[float]]:
+        """The vectors in one response, in input order, or raise ``EmbedError``."""
+        if self._vertex:
+            predictions = payload.get("predictions")
+            if not predictions:
+                raise EmbedError(f"empty 'predictions' in embeddings response from {self._url}")
+            try:
+                return [p["embeddings"]["values"] for p in predictions]
+            except (KeyError, TypeError) as e:
+                raise EmbedError(f"malformed prediction from {self._url}: {e}") from None
+        data = payload.get("data")
+        if not data:
+            raise EmbedError(f"empty 'data' in embeddings response from {self._url}")
+        return [d["embedding"] for d in data]
+
+    def embed(self, texts: list[str], *, task: str = _DOCUMENT) -> list[list[float]]:
         """Embed a batch of texts, returning one vector per input.
 
         Each input is truncated to ``embed_max_chars`` before it is sent. An
         embedding endpoint rejects an over-long input outright rather than
         truncating it for you, and the model behind it has a fixed context, so
-        the choice is between a shorter vector and no vector at all.
+        the choice is between a shorter vector and no vector at all. ``task`` is
+        the Vertex ``task_type`` and is ignored by OpenAI-compatible endpoints.
         """
         if not texts:
             return []
@@ -48,11 +109,8 @@ class Embedder:
         for i in range(0, len(texts), settings.embed_batch_size):
             batch = [_fit(t) for t in texts[i : i + settings.embed_batch_size]]
             try:
-                resp = self._client.post(
-                    self._url,
-                    headers=self._headers,
-                    json={"model": settings.embed_model, "input": batch},
-                )
+                headers, body = self._request(batch, task)
+                resp = self._client.post(self._url, headers=headers, json=body)
                 resp.raise_for_status()
             except httpx.HTTPError as e:
                 body = ""
@@ -61,10 +119,7 @@ class Embedder:
                 raise EmbedError(
                     f"embedding request to {self._url} failed: {e}\nbody: {body}"
                 ) from e
-            data = resp.json().get("data")
-            if not data:
-                raise EmbedError(f"empty 'data' in embeddings response from {self._url}")
-            out.extend(d["embedding"] for d in data)
+            out.extend(self._vectors(resp.json()))
         return out
 
     def embed_one(self, text: str) -> list[float]:
@@ -80,6 +135,10 @@ class Embedder:
         retrieval quietly. One method per side makes each call site say which
         it means.
         """
+        if self._vertex:
+            # The task type IS the asymmetry here; adding the prefix as well
+            # would embed the query somewhere the documents are not.
+            return self.embed([text], task=_QUERY)[0]
         return self.embed([settings.embed_query_prefix + text])[0]
 
     def served_models(self) -> list[str] | None:
@@ -94,7 +153,14 @@ class Embedder:
         is ``{"data": [{"id": ...}]}``; Ollama's is ``{"models": [{"name": ...}]}``.
         llama.cpp answers with both keys at once, but a stricter OpenAI endpoint
         sends only the first.
+
+        Vertex answers ``None``. Its model names are versioned publisher models
+        served under exactly the requested name, so the alias swap this guards
+        against (#220) has no Vertex equivalent, and there is no list endpoint
+        in the embeddings dialect to ask.
         """
+        if self._vertex:
+            return None
         try:
             resp = self._client.get(
                 f"{settings.embed_base_url.rstrip('/')}/models",
