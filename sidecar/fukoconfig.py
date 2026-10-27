@@ -71,6 +71,18 @@ class ModelConfig(BaseModel):
             "the only location current Gemini models are served from."
         ),
     )
+    gcp_service_account: str | None = Field(
+        default=None,
+        description=(
+            "Service account a 'vertex' entry's review runs AS. When set, fuko "
+            "mints a short-lived token for it from the runner's own identity "
+            "(IAM Credentials generateAccessToken; the runner needs "
+            "roles/iam.serviceAccountTokenCreator on it) and serves it to the "
+            "Gemini CLI from a loopback metadata stand-in, so the CLI never "
+            "holds the runner's credential. Unset means the CLI uses the "
+            "runner's ADC directly."
+        ),
+    )
     extra_instructions: str | None = Field(
         default=None,
         description=(

@@ -637,9 +637,24 @@ Vertex. Two facts measured on Gemini CLI 0.65.0 shape this: the Vertex path
 ignores `GOOGLE_CLOUD_ACCESS_TOKEN` (Code Assist reads it, Vertex does not),
 so a short-lived token has to arrive through an ADC source; and a runner with
 no ADC configured at all falls back to the VM's metadata identity, which on a
-shared CI box is usually far broader than a reviewer needs — point
-`GOOGLE_APPLICATION_CREDENTIALS` (or `GCE_METADATA_HOST`) at a narrow
-identity on such a runner.
+shared CI box is usually far broader than a reviewer needs.
+
+**`gcp_service_account` runs the review as a narrow identity without a key.**
+Set it on the entry and fuko mints a token for that account from the runner's
+own credential (IAM Credentials `generateAccessToken`, at most an hour,
+re-minted near expiry), then serves it to the CLI from a loopback metadata
+stand-in (`sidecar/reviewer/gcp_token.py`) named by `GCE_METADATA_HOST`. The
+CLI gets no credentials file and never holds the runner's identity; the token
+never touches disk; the agent has no network tool to reach the port, which
+lives only for the run and answers only `Metadata-Flavor: Google` requests.
+The runner needs `roles/iam.serviceAccountTokenCreator` on the account, and a
+missing grant fails the branch as auth BEFORE the clone. The source is the
+real metadata server on a GCE runner or a gcloud `authorized_user` login on a
+laptop; a service-account key file is refused as the source.
+
+```toml
+gcp_service_account = "ai-reviewer@my-project.iam.gserviceaccount.com"
+```
 
 Credential failures (`Could not load the default credentials`,
 `UNAUTHENTICATED`, `PERMISSION_DENIED`) classify as auth and do not fail

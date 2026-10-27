@@ -54,7 +54,7 @@ from ..presets import (
     ProviderPreset,
     agentic_harness,
 )
-from ..reviewer import gemini_harness
+from ..reviewer import gcp_token, gemini_harness
 from ..reviewer.checkout import (
     CheckoutError,
     checkout_pr_head,
@@ -599,6 +599,7 @@ _AUTH_ADC = "adc"
 _ENV_HARNESS = "FUKO_AGENTIC_HARNESS"
 _ENV_GCP_PROJECT = "FUKO_AGENTIC_GCP_PROJECT"
 _ENV_GCP_LOCATION = "FUKO_AGENTIC_GCP_LOCATION"
+_ENV_GCP_SERVICE_ACCOUNT = "FUKO_AGENTIC_GCP_SERVICE_ACCOUNT"
 # Everything ambient that can decide WHO PAYS or WHERE THE TRAFFIC GOES. The
 # credential three: Claude Code's precedence is ANTHROPIC_AUTH_TOKEN >
 # ANTHROPIC_API_KEY > apiKeyHelper > CLAUDE_CODE_OAUTH_TOKEN > the runner's
@@ -860,6 +861,8 @@ class AgenticBackend:
             _ENV_GCP_PROJECT: model.gcp_project,
             _ENV_GCP_LOCATION: model.gcp_location or gemini_harness.DEFAULT_LOCATION,
         }
+        if model.gcp_service_account:
+            env[_ENV_GCP_SERVICE_ACCOUNT] = model.gcp_service_account
         env.update(self._entry_env(model, knowledge))
         return env
 
@@ -1113,6 +1116,10 @@ class AgenticBackend:
         if raw_extra_deny.strip():
             harness_env[_ENV_EXTRA_DENY_DIRS] = raw_extra_deny
         harness = env.get(_ENV_HARNESS, HARNESS_CLAUDE_CODE)
+        # Set only for a Gemini entry that names `gcp_service_account`; the
+        # stand-in that serves it is started around the run and stopped in the
+        # run's `finally`.
+        impersonated: gcp_token.ImpersonatedToken | None = None
         if harness == HARNESS_GEMINI_CLI:
             project = env.get(_ENV_GCP_PROJECT, "")
             if not project:
@@ -1124,6 +1131,26 @@ class AgenticBackend:
             harness_env = gemini_harness.harness_environment(
                 harness_env, project=project, location=location
             )
+            service_account = env.get(_ENV_GCP_SERVICE_ACCOUNT, "")
+            if service_account:
+                # Minted HERE, before the clone, so a missing TokenCreator grant
+                # costs one API call rather than a checkout. The source is the
+                # AMBIENT environment: the runner's own credential, which the
+                # harness then never sees -- its credentials file is dropped and
+                # it reads the minted token from the stand-in instead.
+                impersonated = gcp_token.ImpersonatedToken(service_account, dict(os.environ))
+                try:
+                    impersonated.current()
+                except gcp_token.GcpTokenError as e:
+                    impersonated.close()
+                    return _failure_result(
+                        "failed:exit 1",
+                        f"agent could not authenticate in adc mode: {_flatten_for_log(str(e))}"[
+                            :DETAIL_CAP
+                        ],
+                    )
+                harness_env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+                harness_env.pop("GCE_METADATA_HOST", None)
             print(
                 f"fuko: agentic harness {model_name}: gemini-cli on "
                 f"{gemini_harness.vertex_endpoint(project, location)}",
@@ -1171,12 +1198,16 @@ class AgenticBackend:
         try:
             ctx = fetch_pr_context(pr.repo, pr.number, token=token, api_url=api_url)
         except httpx.HTTPError as e:
+            if impersonated is not None:
+                impersonated.close()
             return _failure_result("failed:exit 1", f"could not fetch PR context: {e}")
         try:
             checkout = checkout_pr_head(
                 pr.repo, pr.number, ctx.head_sha, token=token, server_url=server_url
             )
         except CheckoutError as e:
+            if impersonated is not None:
+                impersonated.close()
             return _failure_result("failed:exit 1", str(e))
 
         # The lane this branch occupies, which is what per-PR review state is
@@ -1196,6 +1227,7 @@ class AgenticBackend:
         # ownership: it is opened around the run and closed on every exit path,
         # including the ones that never reach the harness.
         workdir: Path | None = None
+        stand_in: gcp_token.MetadataStandIn | None = None
         transcript: Transcript | None = None
         # Lifted off the transcript in the `finally` below, because every return
         # path past that point needs it and the object it comes from is closed
@@ -1307,6 +1339,10 @@ class AgenticBackend:
             # Looked up at call time rather than bound at import, so a test that
             # patches either module attribute reaches the run it means to.
             run = gemini_harness.run_review if harness == HARNESS_GEMINI_CLI else run_review
+            if impersonated is not None:
+                stand_in = gcp_token.MetadataStandIn(impersonated, env.get(_ENV_GCP_PROJECT, ""))
+                stand_in.__enter__()
+                harness_env["GCE_METADATA_HOST"] = stand_in.host
             result = run(
                 prompt,
                 Path(checkout),
@@ -1322,6 +1358,10 @@ class AgenticBackend:
         except OSError as e:
             harness_failure = f"could not prepare the review sandbox: {e}"
         finally:
+            if stand_in is not None:
+                stand_in.__exit__(None, None, None)
+            if impersonated is not None:
+                impersonated.close()
             if transcript is not None:
                 transcript.close()
                 # AFTER `close()`: with a shipping sink that is where the bytes

@@ -3101,3 +3101,118 @@ def test_invoke_refuses_a_gemini_branch_env_without_a_project(monkeypatch):
     result, captured = _gemini_invoke(monkeypatch, HarnessResult(returncode=0, text=""), branch_env)
     assert result.channels == {"agentic-review": "failed:exit 1"}
     assert captured == {}
+
+
+def test_a_service_account_rides_the_branch_env():
+    env = AgenticBackend().build_env(
+        get_preset("vertex"), _vertex(gcp_service_account="ai@p.iam"), "", ["review"]
+    )
+    assert env["FUKO_AGENTIC_GCP_SERVICE_ACCOUNT"] == "ai@p.iam"
+    assert "FUKO_AGENTIC_GCP_SERVICE_ACCOUNT" not in AgenticBackend().build_env(
+        get_preset("vertex"), _vertex(), "", ["review"]
+    )
+
+
+class _FakeToken:
+    instances = []
+
+    def __init__(self, service_account, env, fail=False):
+        self.service_account = service_account
+        self.env = env
+        self.closed = False
+        self.fail = fail
+        _FakeToken.instances.append(self)
+
+    def current(self):
+        if self.fail:
+            raise agentic_mod.gcp_token.GcpTokenError("permission denied on getAccessToken")
+        return agentic_mod.gcp_token.AccessToken("T", 1e12)
+
+    def close(self):
+        self.closed = True
+
+
+def test_invoke_serves_an_impersonated_token_from_a_loopback_stand_in(monkeypatch):
+    _FakeToken.instances = []
+    monkeypatch.setattr(agentic_mod.gcp_token, "ImpersonatedToken", _FakeToken)
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/runner/adc.json")
+    branch_env = AgenticBackend().build_env(
+        get_preset("vertex"), _vertex(gcp_service_account="ai@p.iam"), "", ["review"]
+    )
+    seen = {}
+
+    def fake_gemini(prompt, checkout, *, cwd, model, env, timeout, max_turns, transcript=None):
+        host = env["GCE_METADATA_HOST"]
+        seen["host"] = host
+        seen["env"] = env
+        seen["token"] = httpx.get(
+            f"http://{host}/computeMetadata/v1/instance/service-accounts/default/token",
+            headers={"Metadata-Flavor": "Google"},
+            timeout=5,
+        ).json()["access_token"]
+        return HarnessResult(returncode=0, text=REVIEW_JSON)
+
+    monkeypatch.setattr(agentic_mod, "fetch_pr_context", lambda *a, **k: _ctx())
+    monkeypatch.setattr(agentic_mod, "checkout_pr_head", lambda *a, **k: "/tmp/nowhere")
+    monkeypatch.setattr(agentic_mod, "rmtree", lambda *a, **k: None)
+    monkeypatch.setattr(agentic_mod, "strip_agent_config", lambda *a, **k: [])
+    monkeypatch.setattr(agentic_mod.gemini_harness, "run_review", fake_gemini)
+
+    result = AgenticBackend().invoke(PR, branch_env, ["review"])
+
+    assert result.channels == {"agentic-review": "done"}
+    assert seen["host"].startswith("127.0.0.1:")
+    assert seen["token"] == "T"
+    # The runner's credential is the SOURCE only; the CLI never sees it.
+    assert "GOOGLE_APPLICATION_CREDENTIALS" not in seen["env"]
+    (token,) = _FakeToken.instances
+    assert token.service_account == "ai@p.iam"
+    assert token.env["GOOGLE_APPLICATION_CREDENTIALS"] == "/runner/adc.json"
+    assert token.closed
+    with pytest.raises(httpx.ConnectError):  # stopped after the run
+        httpx.get(f"http://{seen['host']}/computeMetadata/v1/instance", timeout=2)
+
+
+def test_a_failed_impersonation_fails_before_the_checkout(monkeypatch):
+    monkeypatch.setattr(
+        agentic_mod.gcp_token,
+        "ImpersonatedToken",
+        lambda sa, env: _FakeToken(sa, env, fail=True),
+    )
+
+    def no_checkout(*a, **k):
+        raise AssertionError("must fail before fetching or cloning")
+
+    monkeypatch.setattr(agentic_mod, "fetch_pr_context", no_checkout)
+    branch_env = AgenticBackend().build_env(
+        get_preset("vertex"), _vertex(gcp_service_account="ai@p.iam"), "", ["review"]
+    )
+    result = AgenticBackend().invoke(PR, branch_env, ["review"])
+    assert result.channels == {"agentic-review": "failed:exit 1"}
+    assert result.throttled is False
+    assert "could not authenticate in adc mode" in result.detail
+
+
+@pytest.mark.parametrize("failure", ["context", "checkout"])
+def test_the_token_client_is_released_when_the_run_never_starts(monkeypatch, failure):
+    _FakeToken.instances = []
+    monkeypatch.setattr(agentic_mod.gcp_token, "ImpersonatedToken", _FakeToken)
+    if failure == "context":
+
+        def bad_ctx(*a, **k):
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(agentic_mod, "fetch_pr_context", bad_ctx)
+    else:
+        monkeypatch.setattr(agentic_mod, "fetch_pr_context", lambda *a, **k: _ctx())
+
+        def bad_checkout(*a, **k):
+            raise agentic_mod.CheckoutError("clone failed")
+
+        monkeypatch.setattr(agentic_mod, "checkout_pr_head", bad_checkout)
+    branch_env = AgenticBackend().build_env(
+        get_preset("vertex"), _vertex(gcp_service_account="ai@p.iam"), "", ["review"]
+    )
+    result = AgenticBackend().invoke(PR, branch_env, ["review"])
+    assert result.channels == {"agentic-review": "failed:exit 1"}
+    assert _FakeToken.instances[0].closed

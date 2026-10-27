@@ -227,7 +227,10 @@ def _private_home(env: dict[str, str], max_turns: int) -> tuple[Path, dict[str, 
     tmp = home / "tmp"
     tmp.mkdir()
     run_env = dict(env)
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in run_env:
+    # A metadata host means the caller chose the credential source (the
+    # driver's loopback stand-in); a laptop ADC file would outrank it in ADC's
+    # lookup order and silently put the runner's own identity back.
+    if "GOOGLE_APPLICATION_CREDENTIALS" not in run_env and "GCE_METADATA_HOST" not in run_env:
         adc = _default_adc_file(env.get("HOME"))
         if adc:
             run_env["GOOGLE_APPLICATION_CREDENTIALS"] = adc
