@@ -299,3 +299,21 @@ def test_a_missing_cli_says_what_to_install(tmp_path):
         gh.run_review(
             "p", tmp_path, cwd=tmp_path, model="m", env={"PATH": str(tmp_path)}, timeout=5
         )
+
+
+def test_a_metadata_host_outranks_the_laptop_adc_file(tmp_path, monkeypatch):
+    """The driver's stand-in chose the credential; a found ADC file would override it."""
+    monkeypatch.delenv(gh.ENV_SYSTEM_SETTINGS, raising=False)
+    adc = tmp_path / ".config" / "gcloud" / "application_default_credentials.json"
+    adc.parent.mkdir(parents=True)
+    adc.write_text("{}")
+    home, env = gh._private_home(
+        {"HOME": str(tmp_path), "GCE_METADATA_HOST": "127.0.0.1:9"}, max_turns=5
+    )
+    try:
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in env
+        assert env["GCE_METADATA_HOST"] == "127.0.0.1:9"
+    finally:
+        import shutil
+
+        shutil.rmtree(home)
