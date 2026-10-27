@@ -5,6 +5,7 @@ import pytest
 
 from sidecar.config import settings
 from sidecar.embed import EmbedError, Embedder
+from sidecar.reviewer import gcp_token
 from sidecar.retrieve import _build_query
 
 
@@ -108,3 +109,97 @@ def test_assembled_query_reaches_the_endpoint_with_its_files_block(monkeypatch):
     assert "Changed files:\npackages/shared/src/module_0000/index.ts" in sent[0][0]
     # Nothing was cut: the last path posted is the last path assembled, whole.
     assert sent[0][0].endswith(q[-len("index.ts") - 60 :])
+
+
+# --- Vertex AI (native :predict, process ADC) -------------------------------------
+
+
+class _Tok:
+    def __init__(self, env=None, *, client=None):
+        pass
+
+    def bearer(self):
+        return "ADC-TOKEN"
+
+
+@pytest.fixture
+def vertex(monkeypatch):
+    monkeypatch.setattr(settings, "embed_provider", "vertex")
+    monkeypatch.setattr(settings, "embed_vertex_project", "proj")
+    monkeypatch.setattr(settings, "embed_vertex_location", "global")
+    monkeypatch.setattr(settings, "embed_model", "text-embedding-005")
+    monkeypatch.setattr(settings, "embed_dimensions", 768)
+    monkeypatch.setattr(settings, "embed_batch_size", 2)
+    monkeypatch.setattr(gcp_token, "SourceTokenCache", _Tok)
+    calls = []
+
+    def fake_post(self, url, headers=None, json=None):
+        calls.append({"url": url, "headers": headers, "json": json})
+        preds = [
+            {"embeddings": {"values": [float(i)] * 3}} for i, _ in enumerate(json["instances"])
+        ]
+        return httpx.Response(200, json={"predictions": preds}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    return calls
+
+
+def test_vertex_documents_are_batched_predict_calls_with_adc(vertex):
+    vectors = Embedder().embed(["a", "b", "c"])
+    assert len(vectors) == 3
+    assert len(vertex) == 2  # batch size 2
+    first = vertex[0]
+    assert first["url"] == (
+        "https://aiplatform.googleapis.com/v1/projects/proj/locations/global"
+        "/publishers/google/models/text-embedding-005:predict"
+    )
+    assert first["headers"]["Authorization"] == "Bearer ADC-TOKEN"
+    assert first["json"]["instances"] == [
+        {"content": "a", "task_type": "RETRIEVAL_DOCUMENT"},
+        {"content": "b", "task_type": "RETRIEVAL_DOCUMENT"},
+    ]
+    assert first["json"]["parameters"] == {"outputDimensionality": 768}
+
+
+def test_vertex_queries_use_the_task_type_and_never_the_prefix(vertex, monkeypatch):
+    monkeypatch.setattr(settings, "embed_query_prefix", "Instruct: PREFIX\nQuery: ")
+    Embedder().embed_query("how do we lock?")
+    (call,) = vertex
+    assert call["json"]["instances"] == [
+        {"content": "how do we lock?", "task_type": "RETRIEVAL_QUERY"}
+    ]
+
+
+def test_vertex_regional_location_and_native_dimensions(vertex, monkeypatch):
+    monkeypatch.setattr(settings, "embed_vertex_location", "us-central1")
+    monkeypatch.setattr(settings, "embed_dimensions", None)
+    Embedder().embed_one("x")
+    (call,) = vertex
+    assert call["url"].startswith("https://us-central1-aiplatform.googleapis.com/v1/projects/proj/")
+    assert "parameters" not in call["json"]
+
+
+def test_vertex_needs_a_project(monkeypatch):
+    monkeypatch.setattr(settings, "embed_provider", "vertex")
+    monkeypatch.setattr(settings, "embed_vertex_project", "")
+    with pytest.raises(EmbedError, match="FUKO_EMBED_VERTEX_PROJECT"):
+        Embedder()
+
+
+@pytest.mark.parametrize(
+    "payload, match",
+    [({"predictions": []}, "empty 'predictions'"), ({"predictions": [{"nope": 1}]}, "malformed")],
+)
+def test_vertex_bad_responses_are_embed_errors(vertex, monkeypatch, payload, match):
+    def fake_post(self, url, headers=None, json=None):
+        return httpx.Response(200, json=payload, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    with pytest.raises(EmbedError, match=match):
+        Embedder().embed(["a"])
+
+
+def test_vertex_cannot_be_asked_what_it_serves(vertex):
+    embedder = Embedder()
+    assert embedder.served_models() is None
+    embedder.verify_model()  # "cannot verify" never refuses to start

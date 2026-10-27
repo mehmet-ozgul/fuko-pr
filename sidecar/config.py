@@ -1,5 +1,7 @@
 """Configuration loaded from environment variables (prefix FUKO_) and .env."""
 
+from typing import Literal
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -44,6 +46,23 @@ class Settings(BaseSettings):
         "Instruct: Given a code review question, retrieve engineering learnings "
         "that apply to it\nQuery: "
     )
+
+    # Which embeddings API `embed_base_url`/`embed_model` are spoken to with.
+    # "openai" is any OpenAI-compatible `/embeddings` endpoint (the default and
+    # every deployment before this setting). "vertex" is Vertex AI's native
+    # `:predict`, authenticated with the process's own Google credentials (on
+    # GKE, its workload identity) -- Vertex's OpenAI-compatible endpoint does
+    # not serve embeddings (measured 2026-10-27: 400/500 for every model).
+    # With "vertex", queries and documents are told apart by `task_type`
+    # (RETRIEVAL_QUERY / RETRIEVAL_DOCUMENT) and `embed_query_prefix` is NOT
+    # applied: prefixing on top of the task type would put queries in a space
+    # the stored documents are not in.
+    embed_provider: Literal["openai", "vertex"] = "openai"
+    embed_vertex_project: str = ""  # vertex: the project billed for embeddings
+    embed_vertex_location: str = "global"  # vertex: every current model serves global
+    # vertex: `outputDimensionality`; unset keeps the model's native size
+    # (768 for text-embedding-005, 3072 for gemini-embedding-001).
+    embed_dimensions: int | None = Field(default=None, gt=0)
 
     host: str = "0.0.0.0"
     port: int = 8000
