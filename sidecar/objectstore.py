@@ -12,7 +12,7 @@ about how a bucket is reached.
   ``file`` backend uses a content hash (mtime collides for sub-tick writes on
   fast disks, breaking the optimistic-concurrency check).
 * **Many keyed, write-once blobs** (:class:`FileBlobStore` /
-  :class:`S3BlobStore`, #238). A session transcript is written once, under a
+  :class:`S3BlobStore` / :class:`GcsBlobStore`, #238). A session transcript is written once, under a
   key minted before its first byte exists, and never modified. ``put`` takes
   any bytes-like body so the sidecar can hand over the ``bytearray`` it
   accumulated the request into without copying it whole a second time. A concurrency
@@ -35,6 +35,9 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
+
+import httpx
 
 from .config import settings
 from .fukoconfig import ObjectStoreConfig
@@ -312,6 +315,73 @@ class S3BlobStore:
             body.close()
 
 
+class GcsBlobStore:
+    """Keyed write-once blobs in a Google Cloud Storage bucket, with no key file.
+
+    Speaks the GCS JSON API over ``httpx`` rather than S3 interoperability,
+    which on GCS needs an HMAC key -- a long-lived secret this backend exists to
+    avoid. Credentials are the PROCESS's own (``tokens``, a
+    :class:`sidecar.reviewer.gcp_token.SourceTokenCache`): on GKE, its workload
+    identity through the metadata server.
+
+    Write-once is enforced by the SERVER, as in :class:`S3BlobStore`:
+    ``ifGenerationMatch=0`` makes the upload succeed only if no live object has
+    the name, so a lost race is a ``412`` and a :class:`BlobExists`, never an
+    overwrite. Uploads are single-request ``media`` uploads, which GCS accepts
+    up to 5 TiB -- far above the sidecar's own transcript ceiling.
+    """
+
+    API = "https://storage.googleapis.com"
+
+    def __init__(
+        self,
+        bucket: str,
+        prefix: str = "",
+        *,
+        tokens,
+        client: httpx.Client | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        """Bind ``bucket`` and a key ``prefix``; ``base_url`` targets an emulator."""
+        self._bucket = bucket
+        cleaned = prefix.strip().strip("/")
+        self._prefix = f"{cleaned}/" if cleaned else ""
+        self._tokens = tokens
+        # Bounded for the same reason as the S3 client below: a request handler
+        # stands between a review and its completion.
+        self._client = client or httpx.Client(timeout=httpx.Timeout(60.0, connect=5.0))
+        self._base = (base_url or self.API).rstrip("/")
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._tokens.bearer()}"}
+
+    def put(self, key: str, data: bytes | bytearray) -> None:
+        """Conditionally create the object, mapping a lost race to ``BlobExists``."""
+        name = self._prefix + validate_blob_key(key)
+        resp = self._client.post(
+            f"{self._base}/upload/storage/v1/b/{quote(self._bucket, safe='')}/o",
+            params={"uploadType": "media", "name": name, "ifGenerationMatch": "0"},
+            headers={**self._headers(), "Content-Type": "application/octet-stream"},
+            content=bytes(data),
+        )
+        if resp.status_code == 412:
+            raise BlobExists(f"blob {key} already exists")
+        resp.raise_for_status()
+
+    def get(self, key: str) -> bytes | None:
+        """Return the object's bytes, or ``None`` when the key holds nothing."""
+        name = self._prefix + validate_blob_key(key)
+        resp = self._client.get(
+            f"{self._base}/storage/v1/b/{quote(self._bucket, safe='')}/o/{quote(name, safe='')}",
+            params={"alt": "media"},
+            headers=self._headers(),
+        )
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.content
+
+
 @dataclass(frozen=True)
 class BlobStoreConfig:
     """Where keyed write-once blobs live.
@@ -457,10 +527,18 @@ def make_blob_store(cfg: BlobStoreConfig):
         if not cfg.root:
             raise ValueError("the 'file' transcript store needs FUKO_TRANSCRIPT_STORE_ROOT")
         return FileBlobStore(str(local_blob_root(cfg)))
-    if cfg.backend not in ("s3", "r2"):
-        raise ValueError(f"unknown transcript store backend {cfg.backend!r} (file | s3 | r2)")
+    if cfg.backend not in ("s3", "r2", "gcs"):
+        raise ValueError(f"unknown transcript store backend {cfg.backend!r} (file | s3 | r2 | gcs)")
     if not cfg.bucket:
-        raise ValueError("the s3/r2 transcript store needs FUKO_TRANSCRIPT_STORE_BUCKET")
+        raise ValueError(f"the {cfg.backend} transcript store needs FUKO_TRANSCRIPT_STORE_BUCKET")
+    if cfg.backend == "gcs":
+        # Lazy for the same reason boto3 is: a deployment on another backend
+        # never pays for it. `endpoint_url` doubles as the emulator address.
+        from .reviewer.gcp_token import SourceTokenCache
+
+        return GcsBlobStore(
+            cfg.bucket, cfg.prefix, tokens=SourceTokenCache(), base_url=cfg.endpoint_url
+        )
     # `boto3` before `botocore`, deliberately: on an install without the `s3`
     # extra BOTH are missing, and whichever is imported first names the module
     # in the `ModuleNotFoundError` the endpoint turns into a 503. Naming the

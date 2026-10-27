@@ -92,7 +92,12 @@ def _adc_file(env: dict[str, str]) -> Path | None:
 
 
 def source_token(env: dict[str, str], client: httpx.Client) -> str:
-    """Return an access token for the RUNNER's own identity.
+    """Return an access token for the RUNNER's own identity (see :func:`source_access_token`)."""
+    return source_access_token(env, client).value
+
+
+def source_access_token(env: dict[str, str], client: httpx.Client) -> AccessToken:
+    """Return the RUNNER's own access token, with the expiry its issuer stated.
 
     An ADC file wins when there is one (explicit, else gcloud's default under
     ``HOME``), and only the ``authorized_user`` type is supported; otherwise
@@ -125,7 +130,7 @@ def source_token(env: dict[str, str], client: httpx.Client) -> str:
             raise GcpTokenError(f"ADC file {adc} lacks {e}") from None
         except httpx.HTTPError as e:
             raise GcpTokenError(f"refreshing the ADC login failed: {e}") from None
-        return _token_from(resp, "refreshing the ADC login")
+        return _access_token_from(resp, "refreshing the ADC login")
     host = env.get("GCE_METADATA_HOST", "").strip() or _REAL_METADATA_HOST
     url = f"http://{host}/computeMetadata/v1/instance/service-accounts/default/token"
     try:
@@ -134,7 +139,25 @@ def source_token(env: dict[str, str], client: httpx.Client) -> str:
         raise GcpTokenError(
             f"no ADC file and the metadata server at {host} is unreachable: {e}"
         ) from None
-    return _token_from(resp, "the metadata server")
+    return _access_token_from(resp, "the metadata server")
+
+
+#: Assumed life of a source token whose issuer named none; short on purpose.
+_UNSTATED_LIFETIME_S = 300
+
+
+def _access_token_from(resp: httpx.Response, what: str) -> AccessToken:
+    """An :class:`AccessToken` from an OAuth-shaped response, or raise.
+
+    Both issuers answer ``expires_in``; a missing or garbled one is read as a
+    short life rather than a long one, so the worst case is an extra fetch.
+    """
+    value = _token_from(resp, what)
+    try:
+        lifetime = int(resp.json().get("expires_in", _UNSTATED_LIFETIME_S))
+    except (TypeError, ValueError, AttributeError):
+        lifetime = _UNSTATED_LIFETIME_S
+    return AccessToken(value=value, expires_at=time.monotonic() + max(0, lifetime))
 
 
 def _token_from(resp: httpx.Response, what: str) -> str:
@@ -148,6 +171,32 @@ def _token_from(resp: httpx.Response, what: str) -> str:
     if not isinstance(token, str) or not token:
         raise GcpTokenError(f"{what} answered with an empty access_token")
     return token
+
+
+class SourceTokenCache:
+    """This PROCESS's own token, cached until near expiry; thread-safe.
+
+    For the sidecar's own Google calls (the ``gcs`` blob store, Vertex
+    embeddings), which run as the process's identity -- on GKE, its workload
+    identity through the metadata server -- and need no impersonation. A fetch
+    per request would cost a metadata round trip at best and an OAuth refresh at
+    worst; one per token life costs neither.
+    """
+
+    def __init__(self, env: dict[str, str] | None = None, *, client: httpx.Client | None = None):
+        """Read the credential source from ``env`` (default: the process env) on first use."""
+        self._env = None if env is None else dict(env)
+        self._client = client or httpx.Client(timeout=_HTTP_TIMEOUT)
+        self._lock = threading.Lock()
+        self._token: AccessToken | None = None
+
+    def bearer(self) -> str:
+        """A valid access token, fetched first if the cached one is near expiry."""
+        with self._lock:
+            if self._token is None or self._token.seconds_left() < REFRESH_MARGIN_S:
+                env = dict(os.environ) if self._env is None else self._env
+                self._token = source_access_token(env, self._client)
+            return self._token.value
 
 
 class ImpersonatedToken:
