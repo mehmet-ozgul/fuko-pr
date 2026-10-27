@@ -82,10 +82,10 @@ class Settings(BaseSettings):
     # The RUNNER reads these too, but only on the path where no `FUKO_URL` is
     # set (a laptop `fuko review`); a runner pointed at a sidecar ships through
     # it and needs no storage credentials of its own.
-    transcript_store_backend: str = ""  # "" (off) | file | s3 | r2
+    transcript_store_backend: str = ""  # "" (off) | file | s3 | r2 | gcs (ADC, no key)
     transcript_store_root: str = ""  # file backend: the directory holding blobs
-    transcript_store_bucket: str = ""  # s3/r2
-    transcript_store_prefix: str = ""  # s3/r2: key prefix inside the bucket
+    transcript_store_bucket: str = ""  # s3/r2/gcs
+    transcript_store_prefix: str = ""  # s3/r2/gcs: key prefix inside the bucket
     transcript_store_endpoint_url: str = ""  # s3/r2: set for R2 and S3-compatibles
     # Names the two credential variables read for s3/r2:
     # <prefix>_ACCESS_KEY_ID and <prefix>_SECRET_ACCESS_KEY (plus <prefix>_REGION).

@@ -228,3 +228,57 @@ def test_a_failed_mint_reaches_the_cli_as_a_server_error():
         resp = _get(stand_in.host, "/computeMetadata/v1/instance/service-accounts/default/token")
         assert resp.status_code == 500
         assert "no grant" in resp.text
+
+
+# --- the process's own token, cached ---------------------------------------------
+
+
+def test_source_access_token_carries_the_stated_lifetime(tmp_path):
+    client = _client(lambda r: httpx.Response(200, json={"access_token": "A", "expires_in": 1800}))
+    token = gt.source_access_token({"HOME": str(tmp_path), "GCE_METADATA_HOST": "h"}, client)
+    assert token.value == "A"
+    assert 1790 <= token.seconds_left() <= 1800
+
+
+@pytest.mark.parametrize("expires_in", [None, "soon", -5])
+def test_an_unstated_or_garbled_lifetime_is_read_as_short(tmp_path, expires_in):
+    body = {"access_token": "A"}
+    if expires_in is not None:
+        body["expires_in"] = expires_in
+    client = _client(lambda r: httpx.Response(200, json=body))
+    token = gt.source_access_token({"HOME": str(tmp_path), "GCE_METADATA_HOST": "h"}, client)
+    assert token.seconds_left() <= gt._UNSTATED_LIFETIME_S
+
+
+def test_the_source_token_cache_fetches_once_per_token_life(tmp_path, monkeypatch):
+    clock = [5000.0]
+    monkeypatch.setattr(gt.time, "monotonic", lambda: clock[0])
+    fetches = []
+
+    def handler(request):
+        fetches.append(1)
+        return httpx.Response(200, json={"access_token": f"T{len(fetches)}", "expires_in": 3600})
+
+    cache = gt.SourceTokenCache(
+        {"HOME": str(tmp_path), "GCE_METADATA_HOST": "h"}, client=_client(handler)
+    )
+    assert cache.bearer() == "T1"
+    clock[0] += 3000  # 600 s left
+    assert cache.bearer() == "T1"
+    clock[0] += 400  # 200 s left: inside the margin
+    assert cache.bearer() == "T2"
+    assert len(fetches) == 2
+
+
+def test_the_source_token_cache_reads_the_process_env_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setenv("GCE_METADATA_HOST", "10.9.9.9:8080")
+    seen = {}
+
+    def handler(request):
+        seen["host"] = request.url.host
+        return httpx.Response(200, json={"access_token": "P", "expires_in": 3600})
+
+    assert gt.SourceTokenCache(client=_client(handler)).bearer() == "P"
+    assert seen["host"] == "10.9.9.9"

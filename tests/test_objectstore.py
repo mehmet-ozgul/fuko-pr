@@ -2,6 +2,7 @@
 
 import io
 
+import httpx
 import pytest
 
 from sidecar import objectstore
@@ -12,6 +13,7 @@ from sidecar.objectstore import (
     BlobStoreConfig,
     FileBlobStore,
     FileObjectStore,
+    GcsBlobStore,
     PreconditionFailed,
     S3BlobStore,
     S3ObjectStore,
@@ -320,7 +322,7 @@ def test_the_file_blob_backend_needs_a_root(tmp_path):
 
 def test_an_unknown_blob_backend_is_refused():
     with pytest.raises(ValueError):
-        make_blob_store(BlobStoreConfig(backend="gcs", bucket="b"))
+        make_blob_store(BlobStoreConfig(backend="azure", bucket="b"))
 
 
 def test_the_s3_blob_backend_needs_a_bucket():
@@ -354,3 +356,94 @@ def test_the_transcript_store_is_read_from_the_environment(monkeypatch, tmp_path
     monkeypatch.setattr(settings, "transcript_store_backend", "FILE")
     monkeypatch.setattr(settings, "transcript_store_root", str(tmp_path))
     assert isinstance(transcript_store(), FileBlobStore)
+
+
+# --- gcs (JSON API, ADC, no key) -------------------------------------------------
+
+
+class _Tokens:
+    def bearer(self):
+        return "TOK"
+
+
+def _gcs(handler, prefix="runs/"):
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    return GcsBlobStore("my-bucket", prefix, tokens=_Tokens(), client=client)
+
+
+def test_gcs_put_is_a_conditional_media_upload():
+    seen = {}
+
+    def handler(request):
+        seen["request"] = request
+        return httpx.Response(200, json={"name": "x"})
+
+    _gcs(handler).put("20261027T1-abc", bytearray(b"payload"))
+    req = seen["request"]
+    assert req.method == "POST"
+    assert req.url.path == "/upload/storage/v1/b/my-bucket/o"
+    assert req.url.params["uploadType"] == "media"
+    assert req.url.params["name"] == "runs/20261027T1-abc"
+    assert req.url.params["ifGenerationMatch"] == "0"  # write-once, server-enforced
+    assert req.headers["Authorization"] == "Bearer TOK"
+    assert req.content == b"payload"
+
+
+def test_gcs_put_maps_a_lost_race_to_blob_exists():
+    with pytest.raises(BlobExists):
+        _gcs(lambda r: httpx.Response(412)).put("k1", b"x")
+
+
+def test_gcs_put_raises_other_failures():
+    with pytest.raises(httpx.HTTPStatusError):
+        _gcs(lambda r: httpx.Response(403, text="denied")).put("k1", b"x")
+
+
+def test_gcs_put_refuses_an_unsafe_key_before_any_request():
+    def handler(request):
+        raise AssertionError("no request may be made")
+
+    with pytest.raises(ValueError):
+        _gcs(handler).put("../escape", b"x")
+
+
+def test_gcs_get_reads_media_and_maps_absence_to_none():
+    seen = {}
+
+    def handler(request):
+        seen["url"] = request.url
+        if request.url.path.endswith("missing"):
+            return httpx.Response(404)
+        return httpx.Response(200, content=b"bytes")
+
+    store = _gcs(handler, prefix="")
+    assert store.get("present") == b"bytes"
+    assert seen["url"].path == "/storage/v1/b/my-bucket/o/present"
+    assert seen["url"].params["alt"] == "media"
+    assert store.get("missing") is None
+    with pytest.raises(httpx.HTTPStatusError):
+        _gcs(lambda r: httpx.Response(500)).get("k")
+
+
+def test_gcs_prefixed_names_are_one_encoded_path_segment():
+    seen = {}
+
+    def handler(request):
+        seen["raw"] = request.url.raw_path
+        return httpx.Response(200, content=b"")
+
+    _gcs(handler, prefix="/a/b/").get("k")
+    assert seen["raw"].startswith(b"/storage/v1/b/my-bucket/o/a%2Fb%2Fk")
+
+
+def test_make_blob_store_builds_gcs_without_credentials_env():
+    store = make_blob_store(
+        BlobStoreConfig(backend="gcs", bucket="b", prefix="p", endpoint_url="http://emu:4443/")
+    )
+    assert isinstance(store, GcsBlobStore)
+    assert store._base == "http://emu:4443"
+
+
+def test_the_gcs_blob_backend_needs_a_bucket():
+    with pytest.raises(ValueError, match="gcs"):
+        make_blob_store(BlobStoreConfig(backend="gcs"))
