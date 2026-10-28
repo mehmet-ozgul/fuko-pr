@@ -979,6 +979,30 @@ override, which is what lets one fleet mix harnesses (the correlation fix the
 2026-07-31 audit motivated) and what a `role = "trial"` seat on a new driver
 rides in on.
 
+### Shadow mode: `[review] post = false`
+
+A trial on someone else's repository usually has to start before its authors
+see any output. With `post = false` every seat runs exactly as it would live: it
+reviews, settles its findings and coverage ledgers, and records its run row and
+transcript. It just never writes to the pull request. There is no review, no
+inline comment and no A/B branch header. The findings stay in the ledger
+(`GET /rs/findings`), and the run rows say how many there were.
+
+```toml
+[review]
+backend = "agentic"
+post = false
+```
+
+Only the agentic backend honours it. PR-Agent posts from inside its own
+container before the runner sees a result, so a config that sets `post = false`
+with any pr-agent seat is refused at parse time.
+
+Each run row also records the commit it reviewed (`head_sha`, `migrations/014`),
+and `GET /metrics/runs?repo=<owner/repo>&pr=<n>` returns a PR's newest rows with
+it. A scheduler uses that read to skip heads that already have a review. PR-Agent
+rows, and rows written before this change, have a null head.
+
 Current limits, on purpose:
 
 - **Runner prerequisite:** the `claude` CLI must be installed on the runner

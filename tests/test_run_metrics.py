@@ -298,9 +298,9 @@ def test_record_writes_an_unstorable_cost_as_unmeasured(monkeypatch):
     run_metrics.record("o/r", 7, "p", "m", input_tokens=5, cost_usd=1e9)
     params = captured["params"]
     # ..., input_tokens, output_tokens, cache_read, cache_write, cost_usd,
-    # turns, transcript_key
-    assert params[-3] is None
-    assert params[-7] == 5
+    # turns, transcript_key, head_sha
+    assert params[-4] is None
+    assert params[-8] == 5
 
 
 def test_cost_aggregates_are_not_coalesced():
@@ -704,7 +704,7 @@ def test_record_writes_the_index_row_first_and_then_the_reference(monkeypatch):
     assert index_params[3] == 4_200_000 and index_params[4] == 31
     run_sql, run_params = conn.statements[1]
     assert run_sql.startswith("INSERT INTO review_runs") and "transcript_key" in run_sql
-    assert run_params[-1] == _INDEX["key"]
+    assert run_params[-2] == _INDEX["key"]
     # TWO blocks, not one: a single db_best_effort block is a single
     # transaction, and a failing index insert would roll the run row back.
     assert len(blocks) == 2
@@ -717,7 +717,7 @@ def test_a_failing_index_write_leaves_the_review_runs_row_intact(monkeypatch, ca
     run_metrics.record("o/r", 7, "p", "m", findings=3, transcript=dict(_INDEX))
     run_sql, run_params = conn.statements[1]
     assert run_sql.startswith("INSERT INTO review_runs")
-    assert run_params[-1] is None
+    assert run_params[-2] is None
     assert "transcript index write failed" in capsys.readouterr().err
 
 
@@ -752,7 +752,7 @@ def test_a_run_without_a_transcript_writes_no_index_row_and_a_null_reference(mon
     conn, blocks = _pg(monkeypatch)
     run_metrics.record("o/r", 7, "p", "m")
     assert len(conn.statements) == 1 and len(blocks) == 1
-    assert conn.statements[0][1][-1] is None
+    assert conn.statements[0][1][-2] is None
 
 
 def test_record_drops_a_key_the_blob_store_could_never_have_held(monkeypatch, capsys):
@@ -762,7 +762,7 @@ def test_record_drops_a_key_the_blob_store_could_never_have_held(monkeypatch, ca
     run_metrics.record("o/r", 7, "p", "m", transcript={**_INDEX, "key": "../../etc/passwd"})
     assert len(conn.statements) == 1
     assert conn.statements[0][0].startswith("INSERT INTO review_runs")
-    assert conn.statements[0][1][-1] is None
+    assert conn.statements[0][1][-2] is None
     assert "invalid key" in capsys.readouterr().err
 
 
@@ -782,7 +782,7 @@ def test_record_drops_call_counts_the_column_is_not_documented_to_hold(monkeypat
     )
     assert json.loads(conn.statements[0][1][2]) == {"Read": 3, "Ok": 0}
     # The row itself still lands, and the reference with it.
-    assert conn.statements[1][1][-1] == _INDEX["key"]
+    assert conn.statements[1][1][-2] == _INDEX["key"]
 
 
 def test_the_request_model_rejects_a_negative_call_count():
@@ -820,7 +820,7 @@ def test_record_skips_an_index_whose_figures_are_not_measurements(
     run_metrics.record("o/r", 7, "p", "m", findings=3, transcript={**_INDEX, field: value})
     assert len(conn.statements) == 1
     assert conn.statements[0][0].startswith("INSERT INTO review_runs")
-    assert conn.statements[0][1][-1] is None
+    assert conn.statements[0][1][-2] is None
     assert "unusable figures" in capsys.readouterr().err
 
 
@@ -831,7 +831,7 @@ def test_record_reads_an_absent_total_as_a_real_zero(monkeypatch):
     conn, _ = _pg(monkeypatch)
     run_metrics.record("o/r", 7, "p", "m", transcript={"key": _INDEX["key"], "complete": True})
     assert conn.statements[0][1][3] == 0 and conn.statements[0][1][4] == 0
-    assert conn.statements[1][1][-1] == _INDEX["key"]
+    assert conn.statements[1][1][-2] == _INDEX["key"]
 
 
 def test_the_request_model_refuses_a_boolean_spelled_as_a_call_count():
@@ -865,7 +865,7 @@ def test_record_accepts_the_request_model_the_endpoint_hands_it(monkeypatch):
     conn, _ = _pg(monkeypatch)
     run_metrics.record("o/r", 7, "p", "m", transcript=TranscriptIndexRequest(**_INDEX))
     assert conn.statements[0][1][0] == _INDEX["key"]
-    assert conn.statements[1][1][-1] == _INDEX["key"]
+    assert conn.statements[1][1][-2] == _INDEX["key"]
 
 
 def test_metrics_run_endpoint_carries_the_transcript(monkeypatch):

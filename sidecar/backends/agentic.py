@@ -689,6 +689,9 @@ class AgenticBackend:
         """
         self.tool_timeout = config.tool_timeout if config else 900
         self.max_turns = (config.max_turns if config else None) or DEFAULT_MAX_TURNS
+        # Shadow mode (`[review] post = false`): normalize_output builds the
+        # signals and stops short of the GitHub write.
+        self.post = config.post if config else True
         # Keyed (pr_url, model, identity): two [[review.models]] entries may
         # legally share a provider/name and differ only by `token_env` (the same
         # model run under two App identities) -- nothing validates uniqueness --
@@ -1607,6 +1610,7 @@ class AgenticBackend:
             detail=f"{len(kept)} findings" + (f" ({review.degraded})" if review.degraded else ""),
             channels={_CHANNEL: f"degraded: {review.degraded}" if review.degraded else "done"},
             transcript=transcript_index,
+            head_sha=ctx.head_sha,
             **_run_costs(result),
         )
 
@@ -1692,6 +1696,14 @@ class AgenticBackend:
             else:
                 overflow.append((f, body))
 
+        if not self.post:
+            # The findings are already in the ledger (settled in invoke) and the
+            # run row takes this count, so shadow mode loses nothing but the post.
+            print(
+                f"fuko: shadow mode: {len(signals)} findings for {model} not posted",
+                file=sys.stderr,
+            )
+            return signals
         posted = self._post_review(
             pr, token, api_url, stash, inline, overflow, label=compare_label or model
         )
