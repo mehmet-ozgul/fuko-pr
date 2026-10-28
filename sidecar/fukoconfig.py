@@ -349,6 +349,28 @@ class ReviewConfig(BaseModel):
         ),
     )
 
+    comment_style: Literal["default", "two-part"] = Field(
+        default="default",
+        description=(
+            '"two-part": a disclosure line, the verdict, what was done and at most '
+            "`human_findings` findings for people, with every finding as Finding v1 "
+            "JSON in a collapsed section for the author's AI assistant; only the "
+            "shown findings become inline comments. Agentic backend only."
+        ),
+    )
+    human_findings: int = Field(
+        default=3,
+        ge=1,
+        description="Findings shown to people (and inline) in the two-part style.",
+    )
+    shadow_preview: bool = Field(
+        default=False,
+        description=(
+            "With post = false, print the review fuko would have posted to the run "
+            "log, so a shadow trial can be judged on the exact comment."
+        ),
+    )
+
     @model_validator(mode="after")
     def _shadow_needs_agentic(self) -> "ReviewConfig":
         """Reject shadow mode for any seat whose driver posts on its own.
@@ -357,15 +379,18 @@ class ReviewConfig(BaseModel):
         before the runner sees the result, so ``post = false`` cannot stop it.
         Failing at parse time beats a shadow trial that quietly comments.
         """
-        if self.post:
-            return self
         named = {self.backend, *(m.backend for m in self.models if m.backend is not None)}
         # A model entry without its own backend inherits [review].backend, which
         # is already in `named`; the deprecated sections carry none of their own.
         posting = sorted(n for n in named if n != "agentic")
-        if posting:
+        if not self.post and posting:
             raise ValueError(
                 f"[review] post = false needs the agentic backend; {posting} post on their own"
+            )
+        if self.comment_style != "default" and posting:
+            raise ValueError(
+                f"[review] comment_style = {self.comment_style!r} needs the agentic backend; "
+                f"{posting} format their own comments"
             )
         return self
 
