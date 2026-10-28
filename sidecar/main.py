@@ -297,8 +297,15 @@ def metrics_run_endpoint(req: models.RunMetricRequest) -> dict:
         cost_usd=req.cost_usd,
         turns=req.turns,
         transcript=req.transcript,
+        head_sha=req.head_sha,
     )
     return {"recorded": True, "persisted": bool(settings.database_url)}
+
+
+@app.get("/metrics/runs", response_model=models.RunsResponse, dependencies=[Depends(_auth)])
+def metrics_runs_endpoint(repo: str, pr: int | None = None, limit: int = 50) -> dict:
+    """Return a repo's newest run rows, optionally for one PR, with the head each reviewed."""
+    return {"runs": run_metrics.recent_runs(repo=repo, limit=limit, pr=pr)}
 
 
 @app.post("/metrics/transcript", dependencies=[Depends(_auth)])

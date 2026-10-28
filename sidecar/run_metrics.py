@@ -298,6 +298,7 @@ def record(
     cost_usd: float | None = None,
     turns: int | None = None,
     transcript=None,
+    head_sha: str | None = None,
 ) -> None:
     """Insert one review-run row (no-op when persistence is disabled).
 
@@ -319,6 +320,9 @@ def record(
     table and its own transaction (:func:`index_transcript`), and only a row
     that landed becomes the reference on this one; anything else records NULL,
     which is what a run with no transcript honestly has.
+
+    ``head_sha`` is the commit the run reviewed, ``None`` when unknown
+    (``migrations/014``).
     """
     if not _enabled():
         return
@@ -330,8 +334,9 @@ def record(
             "INSERT INTO review_runs "
             "(repo, pr, provider, model, slot, duration_s, attempts, outcome, findings, "
             "detail, backend, endpoint, input_tokens, output_tokens, cache_read_tokens, "
-            "cache_write_tokens, cost_usd, turns, transcript_key) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            "cache_write_tokens, cost_usd, turns, transcript_key, head_sha) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            "%s)",
             (
                 repo,
                 pr,
@@ -352,6 +357,7 @@ def record(
                 _storable_cost(cost_usd),
                 turns,
                 transcript_key,
+                head_sha,
             ),
         )
 
@@ -400,34 +406,39 @@ def slot_summary(repo: str | None = None, days: int = 30) -> list[dict]:
     ]
 
 
-def recent_runs(repo: str | None = None, limit: int = 50) -> list[dict]:
+def recent_runs(repo: str | None = None, limit: int = 50, pr: int | None = None) -> list[dict]:
     """Return the newest run rows, bounded (empty when disabled).
 
     ``limit`` is clamped to [1, 200] so the viewer can never issue an
-    unbounded read as ``review_runs`` grows.
+    unbounded read as ``review_runs`` grows. ``pr`` narrows to one pull
+    request (with ``repo``), the read a scheduler makes to skip covered heads.
     """
     if not _enabled():
         return []
     from .db import db_best_effort
 
-    where = ""
+    clauses: list[str] = []
     params: list = []
     if repo:
-        where = "WHERE repo = %s"
+        clauses.append("repo = %s")
         params.append(repo)
+    if pr is not None:
+        clauses.append("pr = %s")
+        params.append(pr)
+    where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(min(max(1, limit), 200))
 
     with db_best_effort() as conn:
         rows = conn.execute(
             "SELECT repo, pr, provider, model, slot, started_at, duration_s, "
-            "attempts, outcome, findings, backend "
+            "attempts, outcome, findings, backend, head_sha "
             f"FROM review_runs {where} ORDER BY started_at DESC LIMIT %s",
             params,
         ).fetchall()
     return [
         {
             "repo": repo_,
-            "pr": pr,
+            "pr": pr_,
             "provider": provider,
             "model": model,
             "slot": slot,
@@ -437,10 +448,11 @@ def recent_runs(repo: str | None = None, limit: int = 50) -> list[dict]:
             "outcome": outcome,
             "findings": findings,
             "backend": backend,
+            "head_sha": head_sha,
         }
         for (
             repo_,
-            pr,
+            pr_,
             provider,
             model,
             slot,
@@ -450,6 +462,7 @@ def recent_runs(repo: str | None = None, limit: int = 50) -> list[dict]:
             outcome,
             findings,
             backend,
+            head_sha,
         ) in rows
     ]
 

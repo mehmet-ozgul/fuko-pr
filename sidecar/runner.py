@@ -484,6 +484,7 @@ def _record_run(
     endpoint: str = "",
     costs: dict | None = None,
     transcript: dict | None = None,
+    head_sha: str | None = None,
 ) -> None:
     """Persist one review-run metrics row (best-effort, never raises).
 
@@ -507,6 +508,9 @@ def _record_run(
     captures none. It travels the same way and for the same reasons; what the
     sidecar does with it (its own row, and only then the reference on this one)
     is :func:`sidecar.run_metrics.record`'s business.
+
+    ``head_sha`` is :attr:`InvokeResult.head_sha`, the commit the branch actually
+    reviewed, so a scheduler can ask whether a head is already covered.
     """
     try:
         fuko_url, fuko_token = _cb_endpoint()
@@ -527,6 +531,7 @@ def _record_run(
             # here, so the DB row and the receipt can never disagree.
             "endpoint": endpoint,
             "transcript": transcript,
+            "head_sha": head_sha,
             **(costs or {}),
         }
         if fuko_url:
@@ -554,6 +559,7 @@ def _record_run(
                 backend=backend,
                 endpoint=endpoint,
                 transcript=transcript,
+                head_sha=head_sha,
                 **(costs or {}),
             )
     except Exception as e:
@@ -760,6 +766,7 @@ def _post_branch_header(
     slot: str | None = None,
     promoted: bool = False,
     backend: str = "pr-agent",
+    post: bool = True,
 ) -> tuple[str | None, int | None, str | None]:
     """Post a model-labelled header issue comment for one A/B branch (best-effort).
 
@@ -783,8 +790,11 @@ def _post_branch_header(
     unavailable. The opening receipt cannot carry the login -- it is only known
     from the response to the post that embeds it -- so ``app`` lands at
     finalization, the receipt scoring actually reads.
+
+    ``post`` false is shadow mode (``[review] post = false``): nothing is posted,
+    and the ``None`` comment id makes :func:`_finalize_branch_header` a no-op too.
     """
-    if not token:
+    if not token or not post:
         return None, None, None
     base = api_url.rstrip("/")
     receipt = RunReceipt(
@@ -1079,6 +1089,7 @@ def _run_pool(
                 endpoint=result.endpoint or "",
                 costs=_costs_of(result),
                 transcript=_transcript_of(result),
+                head_sha=result.head_sha,
             )
             return result
 
@@ -1117,6 +1128,7 @@ def _run_pool(
             # inventing a total the row's provider+model did not incur.
             costs=_costs_of(result),
             transcript=_transcript_of(result),
+            head_sha=result.head_sha,
         )
     return result
 
@@ -1395,6 +1407,7 @@ def _run_compare_branch(
             # keeps a branch's pool single-backend -- but always available and
             # never silently mis-attributed.
             backend=entry.backend or review.backend,
+            post=review.post,
         )
         result = _run_pool(
             backend,
@@ -1570,6 +1583,7 @@ def _review_compare(
                     slot=slot,
                     promoted=bool(getattr(entry, "promoted", False)),
                     backend=entry.backend or review.backend,
+                    post=review.post,
                 )
                 result = _run_pool(
                     entry_backend,

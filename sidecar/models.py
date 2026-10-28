@@ -412,6 +412,37 @@ class RunMetricRequest(BaseModel):
             "exist."
         ),
     )
+    head_sha: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{7,64}$",
+        description=(
+            "The commit the run reviewed. None when the backend never resolved one "
+            "(PR-Agent) or the runner predates it."
+        ),
+    )
+
+
+class RunRow(BaseModel):
+    """One review run returned by ``GET /metrics/runs``, newest first."""
+
+    repo: str
+    pr: int
+    provider: str
+    model: str
+    slot: str | None = None
+    started_at: str
+    duration_s: float
+    attempts: int
+    outcome: str
+    findings: int | None = None
+    backend: str
+    head_sha: str | None = None
+
+
+class RunsResponse(BaseModel):
+    """Body returned by ``GET /metrics/runs``."""
+
+    runs: list[RunRow] = Field(default_factory=list)
 
 
 class RunSummaryRow(BaseModel):

@@ -338,6 +338,37 @@ class ReviewConfig(BaseModel):
             raise ValueError("cooldown_seconds must be > 0")
         return value
 
+    post: bool = Field(
+        default=True,
+        description=(
+            "False is shadow mode: every seat reviews, settles its ledger and "
+            "records its run and transcript, but nothing is written to the pull "
+            "request -- no review, no inline comments, no A/B branch header. For "
+            "trialling a fleet on a repository before its authors see any output. "
+            "Agentic backend only: PR-Agent posts from inside its own container."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _shadow_needs_agentic(self) -> "ReviewConfig":
+        """Reject shadow mode for any seat whose driver posts on its own.
+
+        PR-Agent writes to the PR from inside its container during ``invoke``,
+        before the runner sees the result, so ``post = false`` cannot stop it.
+        Failing at parse time beats a shadow trial that quietly comments.
+        """
+        if self.post:
+            return self
+        named = {self.backend, *(m.backend for m in self.models if m.backend is not None)}
+        # A model entry without its own backend inherits [review].backend, which
+        # is already in `named`; the deprecated sections carry none of their own.
+        posting = sorted(n for n in named if n != "agentic")
+        if posting:
+            raise ValueError(
+                f"[review] post = false needs the agentic backend; {posting} post on their own"
+            )
+        return self
+
     image: str | None = None
     docker_extra_args: list[str] = Field(default_factory=list)
     tool_timeout: int = 900

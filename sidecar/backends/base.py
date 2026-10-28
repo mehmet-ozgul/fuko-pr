@@ -94,6 +94,11 @@ class InvokeResult:
     #: run whose capture is off or failed, so a run with no transcript records
     #: no reference rather than one that would read as a blob gone missing.
     transcript: dict | None = None
+    #: The commit the backend actually reviewed, when it knows one. ``None`` for
+    #: a backend that never resolves its checkout (PR-Agent), and for a run that
+    #: failed before it had one, so the run row records "unknown" rather than a
+    #: head fetched later that the review may never have seen.
+    head_sha: str | None = None
 
 
 @runtime_checkable
