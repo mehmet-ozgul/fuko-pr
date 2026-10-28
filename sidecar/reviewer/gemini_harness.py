@@ -303,6 +303,14 @@ def _gemini_usage(stats: object) -> dict | None:
     raw stats ride along under ``gemini`` for whoever wants a column the
     mapping does not fill. Gemini reports no cache WRITES, so that key is
     absent and reads as "not measured".
+
+    ``output_tokens`` includes the model's thinking. The CLI's own
+    ``output_tokens`` leaves it out, and the only trace of it is
+    ``total_tokens - input_tokens - output_tokens``. Vertex bills thinking as
+    output: on five reviews the CLI reported 36.8K output tokens, while Cloud
+    Monitoring counted 291K for the same window, and the remainder came to
+    245.7K. A remainder that is missing or negative adds nothing, so the
+    figure never claims thinking it cannot show.
     """
     if not isinstance(stats, dict):
         return None
@@ -315,6 +323,13 @@ def _gemini_usage(stats: object) -> dict | None:
         value = _as_int(stats.get(theirs))
         if value is not None:
             usage[ours] = value
+    total = _as_int(stats.get("total_tokens"))
+    inclusive_input = _as_int(stats.get("input_tokens"))
+    output = usage.get("output_tokens")
+    if None not in (total, inclusive_input, output):
+        thinking = total - inclusive_input - output
+        if thinking > 0:
+            usage["output_tokens"] = output + thinking
     return usage
 
 

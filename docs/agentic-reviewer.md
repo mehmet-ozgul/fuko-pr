@@ -717,7 +717,9 @@ file.
 terminal `result` event's `stats` map onto the metrics columns, with Gemini's
 uncached `input` as `input_tokens` and `cached` as `cache_read_tokens`, the
 raw stats kept under `usage.gemini`. There is no cost feed, so `cost_usd` is
-NULL. `turns` counts model responses, derived from the stream: a response
+NULL. `output_tokens` includes thinking: the CLI leaves it out of its own output
+count, and Vertex bills it as output, so it is taken back from `total_tokens -
+input_tokens - output_tokens`. `turns` counts model responses, derived from the stream: a response
 starts with the first assistant text or tool call after the prompt or after
 a tool result, and parallel tool calls share it. Tool calls per turn says how
 far the seat batches. The stream carries no tool OUTPUT, so a transcript

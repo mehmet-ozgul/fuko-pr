@@ -57,7 +57,8 @@ def test_usage_maps_uncached_input_and_keeps_the_raw_stats():
     outcome, _ = _fold({"type": "result", "status": "success", "stats": STATS})
     assert usage_tokens(outcome.usage) == {
         "input_tokens": 10684,
-        "output_tokens": 210,
+        # 210 reported plus 1418 of thinking (16237 - 14609 - 210).
+        "output_tokens": 1628,
         "cache_read_tokens": 3925,
         "cache_write_tokens": None,
     }
@@ -97,6 +98,26 @@ def test_settings_pin_every_helper_alias_to_the_seat_model():
     for name in gh.HELPER_ALIASES_PLAIN:
         assert aliases[name] == {"modelConfig": {"model": "gemini-3.8-flash"}}
     assert "modelConfigs" not in gh.harness_settings(max_turns=42)
+
+
+def test_output_tokens_include_the_thinking_vertex_bills_as_output():
+    # Measured on a real review: total exceeds input + output by the thinking.
+    stats = {
+        "total_tokens": 9135366,
+        "input_tokens": 9061210,
+        "output_tokens": 9098,
+        "cached": 8368910,
+        "input": 692300,
+    }
+    outcome, _ = _fold({"type": "result", "status": "success", "stats": stats})
+    assert usage_tokens(outcome.usage)["output_tokens"] == 9098 + 65058
+    assert outcome.usage["gemini"] == stats
+
+
+def test_output_tokens_never_shrink_on_an_inconsistent_total():
+    stats = {"total_tokens": 10, "input_tokens": 20, "output_tokens": 5, "input": 20}
+    outcome, _ = _fold({"type": "result", "status": "success", "stats": stats})
+    assert usage_tokens(outcome.usage)["output_tokens"] == 5
 
 
 def test_garbled_stats_degrade_per_field():
