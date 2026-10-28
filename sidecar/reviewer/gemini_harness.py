@@ -132,16 +132,59 @@ _GOOGLE_INHERITED_VARS = (
 _GEMINI_ENV_PREFIX = "GEMINI_"
 
 
-def harness_settings(max_turns: int) -> dict:
+#: The CLI's own helper calls -- loop detection and its double check, the
+#: next-speaker and edit checks, history compression -- run on built-in model
+#: aliases that point at PREVIEW models (``gemini-3-flash-preview``,
+#: ``gemini-3-pro-preview`` on CLI 0.65.0), whatever ``--model`` says. Measured
+#: on a review: 43K of 9.1M tokens went to ``gemini-3-flash-preview``. Each alias
+#: is re-pointed at the seat's own model, in the same shape the bundle defines
+#: it, so the checks keep running and no request leaves the model the operator
+#: chose.
+HELPER_ALIASES_ON_BASE = ("gemini-3-flash-base", "loop-detection-double-check")
+HELPER_ALIASES_PLAIN = (
+    "chat-compression-default",
+    "chat-compression-3-flash",
+    "chat-compression-3-pro",
+    "agent-history-provider-summarizer",
+)
+
+#: Appended to the review prompt for this harness. Measured on a review: 97 tool
+#: calls, every one in a turn of its own, about 93K tokens of context re-sent per
+#: turn -- while the reads themselves overlapped by under 1%. The cost is the
+#: number of turns, so the guidance is about turns, not about reading less.
+TOOL_GUIDANCE = """\
+How to use your tools efficiently: every turn re-sends this whole conversation,
+so the number of turns, not the amount you read, is what this review costs.
+- When you need several independent things -- different files, different
+  regions, several symbols to search for -- request them ALL in the same turn as
+  parallel tool calls. Do not issue one call per turn.
+- Read a whole function or a generous window (about 150-300 lines) in one call
+  instead of a run of adjacent small windows. Use read_many_files for several
+  whole small files.
+- Do not narrate between tool calls; think, then call everything you need."""
+
+
+def helper_aliases(model: str) -> dict:
+    """The ``modelConfigs.customAliases`` that keep every helper call on ``model``."""
+    aliases: dict = {
+        name: {"extends": "base", "modelConfig": {"model": model}}
+        for name in HELPER_ALIASES_ON_BASE
+    }
+    aliases.update({name: {"modelConfig": {"model": model}} for name in HELPER_ALIASES_PLAIN})
+    return aliases
+
+
+def harness_settings(max_turns: int, model: str = "") -> dict:
     """The user-scope settings every run is given, in a private home.
 
     Only keys whose effect was observed are set. ``tools.core`` is the boundary
     (see the module docstring); the rest switch off what a reviewer must not
     load or emit -- hooks, skills, agents, checkpointing, usage statistics and
     telemetry, update checks -- and ``ignoreLocalEnv`` stops ``.env`` discovery
-    from the working directory's ancestors.
+    from the working directory's ancestors. With ``model`` set, the CLI's helper
+    calls are pinned to it too (see :data:`HELPER_ALIASES_ON_BASE`).
     """
-    return {
+    settings = {
         "security": {
             "folderTrust": {"enabled": True},
             "auth": {"selectedType": "vertex-ai", "enforcedType": "vertex-ai"},
@@ -163,6 +206,9 @@ def harness_settings(max_turns: int) -> dict:
         "context": {"loadMemoryFromIncludeDirectories": False},
         "model": {"maxSessionTurns": max_turns},
     }
+    if model:
+        settings["modelConfigs"] = {"customAliases": helper_aliases(model)}
+    return settings
 
 
 def harness_environment(base: dict[str, str], *, project: str, location: str) -> dict[str, str]:
@@ -212,7 +258,9 @@ def _default_adc_file(home: str | None) -> str | None:
     return str(path) if path.is_file() else None
 
 
-def _private_home(env: dict[str, str], max_turns: int) -> tuple[Path, dict[str, str]]:
+def _private_home(
+    env: dict[str, str], max_turns: int, model: str = ""
+) -> tuple[Path, dict[str, str]]:
     """Create this run's private home and return it with the environment to use.
 
     The home holds ``.gemini/settings.json`` and a ``tmp`` that becomes
@@ -223,7 +271,9 @@ def _private_home(env: dict[str, str], max_turns: int) -> tuple[Path, dict[str, 
     home = Path(mkdtemp(prefix="fuko-gemini-home-"))
     gemini_dir = home / ".gemini"
     gemini_dir.mkdir()
-    (gemini_dir / "settings.json").write_text(json.dumps(harness_settings(max_turns), indent=1))
+    (gemini_dir / "settings.json").write_text(
+        json.dumps(harness_settings(max_turns, model), indent=1)
+    )
     tmp = home / "tmp"
     tmp.mkdir()
     run_env = dict(env)
@@ -289,9 +339,12 @@ def _consume_gemini_stream(lines, emit) -> _StreamOutcome:
     between tool calls never reaches the JSON parser. ``subtype`` carries the
     terminal ``status`` (``success`` / ``error``), and a failed run's error
     message becomes the text, so the driver's auth and throttle classifiers
-    can read it. ``turns`` stays ``None``: the CLI reports tool calls, not
-    turns, and a different quantity in that column would be a second
-    definition of it.
+    can read it.
+
+    ``turns`` is the number of model responses: one starts with the first
+    assistant text or tool call after the prompt or after a tool result, and
+    every tool call in it belongs to that response. Tool calls per turn is how
+    far the model batches, which is what the review's cost turns on.
     """
     text_since_tool = ""
     error_text = ""
@@ -299,6 +352,8 @@ def _consume_gemini_stream(lines, emit) -> _StreamOutcome:
     reported_status: str | None = None
     saw_result = False
     tool_calls = 0
+    turns = 0
+    awaiting_model = True
     for raw in lines:
         raw = raw.strip()
         if not raw:
@@ -310,6 +365,13 @@ def _consume_gemini_stream(lines, emit) -> _StreamOutcome:
         if not isinstance(event, dict):
             continue
         kind = event.get("type")
+        if awaiting_model and (
+            kind == "tool_use" or (kind == "message" and event.get("role") == "assistant")
+        ):
+            turns += 1
+            awaiting_model = False
+        elif kind == "tool_result":
+            awaiting_model = True
         if kind == "tool_use":
             tool_calls += 1
             text_since_tool = ""
@@ -337,7 +399,7 @@ def _consume_gemini_stream(lines, emit) -> _StreamOutcome:
         saw_result=saw_result,
         usage=reported_usage,
         cost_usd=None,
-        turns=None,
+        turns=turns or None,
         subtype=reported_status,
     )
 
@@ -372,7 +434,14 @@ def run_review(
             "the 'gemini' CLI is not on PATH; install @google/gemini-cli (Node 20+) "
             "on this runner or switch this model entry to another provider"
         )
-    home, run_env = _private_home(env, max_turns)
+    home, run_env = _private_home(env, max_turns, model)
+    prompt = f"{prompt}\n\n{TOOL_GUIDANCE}"
+    # The fixed part every turn re-sends; the CLI reports no per-turn usage.
+    print(
+        f"fuko: agentic {model} prompt {len(prompt)} chars (~{len(prompt) // 4} tokens)",
+        file=sys.stderr,
+        flush=True,
+    )
     cmd = [
         binary,
         "-p",
@@ -425,6 +494,7 @@ def run_review(
             stderr=stderr or f"review timed out after {timeout}s",
             timed_out=True,
             usage=outcome.usage,
+            turns=outcome.turns,
         )
     # The CLI can exit 0 with a failed terminal event; trust the event.
     if returncode == 0 and outcome.subtype not in (None, "success"):
@@ -435,5 +505,5 @@ def run_review(
         stderr=stderr,
         usage=outcome.usage,
         cost_usd=None,
-        turns=None,
+        turns=outcome.turns,
     )

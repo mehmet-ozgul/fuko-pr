@@ -717,10 +717,30 @@ file.
 terminal `result` event's `stats` map onto the metrics columns, with Gemini's
 uncached `input` as `input_tokens` and `cached` as `cache_read_tokens`, the
 raw stats kept under `usage.gemini`. There is no cost feed, so `cost_usd` is
-NULL, and no turn count (the CLI reports tool calls, a different quantity), so
-`turns` is NULL too. The stream carries no tool OUTPUT, so a transcript
+NULL. `turns` counts model responses, derived from the stream: a response
+starts with the first assistant text or tool call after the prompt or after
+a tool result, and parallel tool calls share it. Tool calls per turn says how
+far the seat batches. The stream carries no tool OUTPUT, so a transcript
 records what the agent asked for — tool calls and re-reads are exact — but
-`tool_result_bytes` is 0 for "not in the feed", not "fed nothing".
+`tool_result_bytes` is 0 for "not in the feed", not "fed nothing". A
+`read_file` with a different line range counts as a re-read: on a 6,500-line
+file, nine reads can be nine different windows. The run log's
+`prompt N chars` line is the fixed part every turn re-sends.
+
+**Cost is turns, not reading.** Every turn re-sends the conversation, so a
+review's input grows with turns × context. The first measured review made 97
+tool calls, one per turn, about 93K tokens per request, while its ranged reads
+overlapped by under 1%. The harness therefore appends `TOOL_GUIDANCE` to the
+prompt: batch independent calls into one turn, read whole functions rather
+than adjacent small windows, and don't narrate between calls.
+
+**Helper calls stay on the seat's model.** The CLI runs its own checks — loop
+detection and its double check, next-speaker and edit checks, history
+compression — on built-in aliases that point at preview models
+(`gemini-3-flash-preview`, `gemini-3-pro-preview` on 0.65.0), whatever
+`--model` says. The per-run settings re-point those aliases
+(`modelConfigs.customAliases`) at the seat's model, so the checks keep running
+and every request stays on the model the operator chose.
 
 ## Session transcripts (`FUKO_TRANSCRIPT_DIR`)
 

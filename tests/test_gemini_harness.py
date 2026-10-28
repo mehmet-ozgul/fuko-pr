@@ -67,6 +67,38 @@ def test_usage_maps_uncached_input_and_keeps_the_raw_stats():
     assert outcome.turns is None
 
 
+def test_turns_count_model_responses_and_parallel_calls_share_one():
+    outcome, seen = _fold(
+        {"type": "init", "model": "gemini-x"},
+        {"type": "message", "role": "user", "content": "the prompt"},
+        # Turn 1: two calls in parallel.
+        {"type": "tool_use", "tool_name": "read_file", "parameters": {"file_path": "/r/a.go"}},
+        {"type": "tool_use", "tool_name": "grep_search", "parameters": {"pattern": "X"}},
+        {"type": "tool_result", "status": "success", "output": ""},
+        {"type": "tool_result", "status": "success", "output": ""},
+        # Turn 2: narration, then one call.
+        {"type": "message", "role": "assistant", "content": "now ", "delta": True},
+        {"type": "tool_use", "tool_name": "glob", "parameters": {"pattern": "*.go"}},
+        {"type": "tool_result", "status": "success", "output": ""},
+        # Turn 3: the answer.
+        {"type": "message", "role": "assistant", "content": "{}", "delta": True},
+        {"type": "result", "status": "success", "stats": STATS},
+    )
+    assert outcome.turns == 3
+    assert len(seen) == 3
+
+
+def test_settings_pin_every_helper_alias_to_the_seat_model():
+    s = gh.harness_settings(max_turns=42, model="gemini-3.8-flash")
+    aliases = s["modelConfigs"]["customAliases"]
+    assert set(aliases) == {*gh.HELPER_ALIASES_ON_BASE, *gh.HELPER_ALIASES_PLAIN}
+    for name in gh.HELPER_ALIASES_ON_BASE:
+        assert aliases[name] == {"extends": "base", "modelConfig": {"model": "gemini-3.8-flash"}}
+    for name in gh.HELPER_ALIASES_PLAIN:
+        assert aliases[name] == {"modelConfig": {"model": "gemini-3.8-flash"}}
+    assert "modelConfigs" not in gh.harness_settings(max_turns=42)
+
+
 def test_garbled_stats_degrade_per_field():
     outcome, _ = _fold(
         {"type": "result", "status": "success", "stats": {"input": -1, "output_tokens": True}}
@@ -261,7 +293,8 @@ def test_run_review_spawns_the_hardened_command(fake_cli):
     assert result.returncode == 0
     assert result.text == "FINAL"
     assert usage_tokens(result.usage)["input_tokens"] == 3
-    assert seen["prompt"] == "THE PROMPT"  # over stdin, never argv
+    # Over stdin, never argv, with this harness's tool guidance after it.
+    assert seen["prompt"] == f"THE PROMPT\n\n{gh.TOOL_GUIDANCE}"
     argv = seen["argv"]
     assert argv[:2] == ["-p", ""]
     assert argv[argv.index("--model") + 1] == "gemini-x"
@@ -278,6 +311,15 @@ def test_run_review_spawns_the_hardened_command(fake_cli):
     assert fake_cli.cwd not in home.parents
     assert not home.exists()
     assert seen["settings"]["model"]["maxSessionTurns"] == 7
+    aliases = seen["settings"]["modelConfigs"]["customAliases"]
+    assert {a["modelConfig"]["model"] for a in aliases.values()} == {"gemini-x"}
+    assert result.turns == 1
+
+
+def test_run_review_logs_the_fixed_prompt_size(fake_cli, capsys):
+    fake_cli()
+    expected = len(f"THE PROMPT\n\n{gh.TOOL_GUIDANCE}")
+    assert f"prompt {expected} chars" in capsys.readouterr().err
 
 
 def test_a_failed_terminal_event_is_a_failure_even_on_exit_0(fake_cli):
