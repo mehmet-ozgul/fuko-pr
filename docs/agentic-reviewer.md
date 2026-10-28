@@ -1025,6 +1025,42 @@ and `GET /metrics/runs?repo=<owner/repo>&pr=<n>` returns a PR's newest rows with
 it. A scheduler uses that read to skip heads that already have a review. PR-Agent
 rows, and rows written before this change, have a null head.
 
+### The two-part comment: `[review] comment_style = "two-part"`
+
+The default review shows every finding to whoever reads the PR. Teams that
+already find AI review output a load can ask for less:
+
+```toml
+[review]
+backend = "agentic"
+comment_style = "two-part"
+human_findings = 3      # shown to people, and the only ones posted inline
+shadow_preview = true   # with post = false: print the comment to the run log
+```
+
+The review body then has three parts:
+
+1. **A disclosure line, first.** It says this is a model's review and gives the
+   model, the fuko version, the run id (the transcript key) and the ledger round.
+   It is advisory: it neither approves nor blocks.
+2. **For people.**
+   - The verdict and what was done: a read-only review of a named head, with
+     nothing built, run or tested.
+   - At most `human_findings` findings, most severe first, then most confident.
+     A finding that anchors to the diff is a one-line entry here, with its
+     detail in the inline comment. One that doesn't anchor is shown here in
+     full. No praise and no summary of the diff.
+3. **For the author's AI assistant**, collapsed in `<details>`: handling
+   instructions and every finding as Finding v1 JSON. Fields this reviewer's
+   output contract doesn't produce yet (`symbol`, `failure_sequence`,
+   `proposed_fix`) are absent rather than empty.
+
+Every finding still carries its invisible marker, the lower-ranked ones inside
+the collapsed section, so `fuko signals` recovers all of them. Model-written
+text can't mention anyone (`@` is neutralised), and the JSON fence is always
+longer than any backtick run inside it. Like `post = false`, the style is
+refused at parse time for any seat whose driver formats its own comments.
+
 Current limits, on purpose:
 
 - **Runner prerequisite:** the `claude` CLI must be installed on the runner

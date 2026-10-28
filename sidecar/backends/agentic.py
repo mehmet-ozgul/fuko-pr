@@ -55,6 +55,7 @@ from ..presets import (
     agentic_harness,
 )
 from ..reviewer import gcp_token, gemini_harness
+from ..reviewer.comment import RunFacts, render_two_part
 from ..reviewer.checkout import (
     CheckoutError,
     checkout_pr_head,
@@ -666,6 +667,12 @@ class _PendingReview:
     #: these were confident enough to report and the cap is ours, so they are
     #: reported separately rather than as "low-confidence".
     over_cap: int = 0
+    #: The run's transcript key (its identity from run start), the ledger round
+    #: and how many regions the agent recorded as examined: what the two-part
+    #: comment states about the run.
+    run_id: str = ""
+    round: int | None = None
+    examined: int = 0
 
 
 class AgenticBackend:
@@ -692,6 +699,9 @@ class AgenticBackend:
         # Shadow mode (`[review] post = false`): normalize_output builds the
         # signals and stops short of the GitHub write.
         self.post = config.post if config else True
+        self.comment_style = config.comment_style if config else "default"
+        self.human_findings = config.human_findings if config else 3
+        self.shadow_preview = config.shadow_preview if config else False
         # Keyed (pr_url, model, identity): two [[review.models]] entries may
         # legally share a provider/name and differ only by `token_env` (the same
         # model run under two App identities) -- nothing validates uniqueness --
@@ -1593,6 +1603,9 @@ class AgenticBackend:
                 diff_positions=ctx.diff_positions,
                 withheld_low=len(review.findings) - len(confident),
                 over_cap=len(confident) - len(kept),
+                run_id=(transcript_index or {}).get("key") or "",
+                round=carried.round,
+                examined=len(review.examined),
             )
         # A COMPLETED run states its channel finished, rather than leaving an empty
         # map that `fuko_states` cannot tell from a dead channel (#113). This is the
@@ -1656,6 +1669,7 @@ class AgenticBackend:
             return []
 
         signals: list[ReviewSignal] = []
+        pairs: list[tuple[AgenticFinding, ReviewSignal]] = []
         inline: list[tuple[AgenticFinding, dict]] = []
         overflow: list[tuple[AgenticFinding, str]] = []
         for f in stash.findings:
@@ -1674,6 +1688,7 @@ class AgenticBackend:
                 role=role,
             )
             signals.append(signal)
+            pairs.append((f, signal))
             body = f"**{f.title}**\n\n{f.body}"
             if f.evidence:
                 body += f"\n\n*Verified against:* {f.evidence}"
@@ -1696,6 +1711,26 @@ class AgenticBackend:
             else:
                 overflow.append((f, body))
 
+        body: str | None = None
+        if self.comment_style == "two-part":
+            rendered = render_two_part(
+                pairs,
+                pr=pr.number,
+                header=_review_header(compare_label or model),
+                facts=RunFacts(
+                    model=model,
+                    head_sha=stash.head_sha,
+                    run_id=stash.run_id,
+                    round=stash.round,
+                    examined=stash.examined,
+                    withheld_low=stash.withheld_low,
+                    over_cap=stash.over_cap,
+                ),
+                human_findings=self.human_findings,
+                anchorable=lambda f: self._anchorable(stash, f),
+            )
+            body, inline = rendered.body, rendered.inline
+
         if not self.post:
             # The findings are already in the ledger (settled in invoke) and the
             # run row takes this count, so shadow mode loses nothing but the post.
@@ -1703,9 +1738,18 @@ class AgenticBackend:
                 f"fuko: shadow mode: {len(signals)} findings for {model} not posted",
                 file=sys.stderr,
             )
+            if self.shadow_preview and body is not None:
+                print("fuko: shadow preview of the review body:", file=sys.stderr)
+                for line in body.splitlines():
+                    print(f"fuko: shadow| {line}", file=sys.stderr)
+                for _, comment in inline:
+                    print(
+                        f"fuko: shadow| [inline {comment['path']}:{comment['line']}]",
+                        file=sys.stderr,
+                    )
             return signals
         posted = self._post_review(
-            pr, token, api_url, stash, inline, overflow, label=compare_label or model
+            pr, token, api_url, stash, inline, overflow, label=compare_label or model, body=body
         )
         return signals if posted else []
 
@@ -1790,8 +1834,13 @@ class AgenticBackend:
         inline: list[tuple[AgenticFinding, dict]],
         overflow: list[tuple[AgenticFinding, str]],
         label: str = "",
+        body: str | None = None,
     ) -> bool:
-        """POST one PR review; retry body-only on a 422; report success."""
+        """POST one PR review; retry body-only on a 422; report success.
+
+        ``body`` is a review body already rendered in full (the two-part style);
+        ``overflow`` is then ignored, because that body places every finding.
+        """
         headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
@@ -1799,6 +1848,8 @@ class AgenticBackend:
         if token:
             headers["Authorization"] = "Bearer " + token
         body_parts = [_review_header(label), "", stash.summary or "(no summary)"]
+        if body is not None:
+            body_parts, overflow = [body.rstrip()], []
         if overflow:
             body_parts += ["", "### Findings without a diff anchor", ""]
             body_parts += [
@@ -1809,9 +1860,9 @@ class AgenticBackend:
                     for f, body in overflow
                 )
             ]
-        if stash.withheld_low:
+        if stash.withheld_low and body is None:
             body_parts += ["", f"*{stash.withheld_low} low-confidence finding(s) withheld.*"]
-        if stash.over_cap:
+        if stash.over_cap and body is None:
             body_parts += [
                 "",
                 f"*{stash.over_cap} further finding(s) cut by the {MAX_FINDINGS}-finding cap.*",
