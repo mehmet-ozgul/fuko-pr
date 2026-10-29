@@ -674,6 +674,7 @@ agent and a custom command:
 | read outside the workspace roots | refused | refused |
 | root `GEMINI.md` in context | loaded | stripped |
 | `GEMINI.md` attached when a sibling file is read | loaded | stripped |
+| `@path` in the diff or PR text inlines that file | inlined | escaped |
 
 ¹ run from the checkout with `--skip-trust --yolo`.
 
@@ -707,6 +708,18 @@ What produces the right-hand column, each property load-bearing:
    designing for: rules a seat must follow belong in `extra_instructions` or
    the knowledge base — from the base branch — never in a context file the
    PR under review can edit.
+6. **The prompt is text, never an `@` command.** Headless mode runs the CLI's
+   `@path` expansion over the whole input. A token naming a file or directory
+   in a workspace root is replaced by its contents ("Content from referenced
+   files"), so a diff that mentions `@module/CLAUDE.md` hands the model the PR
+   head's copy of a file the runner reads from the trusted branch. A token
+   naming nothing is searched for with a recursive glob over every root, once
+   per `@`, and each diff hunk header has two: on a 40K-file monorepo that was
+   about 1.3 s per hunk header, and a 90-hunk diff exhausted the CLI's heap
+   before the first model call. fuko puts a backslash before every `@` in the
+   prompt, which the parser skips, tells the model what the backslash means,
+   and removes any it copies into its answer. The settings also turn
+   `context.fileFiltering.enableRecursiveFileSearch` off.
 
 An operator who bakes admin settings into the runner image can point
 `FUKO_GEMINI_SYSTEM_SETTINGS` at them; the CLI ignores a system settings file

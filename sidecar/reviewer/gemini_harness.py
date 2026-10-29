@@ -54,6 +54,19 @@ The properties that produce the right-hand column, each load-bearing:
   driver's :func:`sidecar.reviewer.checkout.strip_agent_config` removes them,
   at every depth and in any letter case, before the run. ``AGENTS.md`` and
   ``CLAUDE.md`` are not read by this CLI.
+* **The prompt is text, never an @-command.** Headless mode runs the CLI's
+  ``@path`` expansion over the whole input. A token that names a file or
+  directory in a workspace root is silently replaced by its contents ("Content
+  from referenced files"), so a diff or PR body that mentions
+  ``@module/CLAUDE.md`` hands the model the PR head's copy of a file the
+  runner deliberately reads from the trusted branch. A token that names
+  nothing is looked up with a recursive glob over every root: one walk of the
+  checkout per ``@``, and every diff hunk header has two. On a 40K-file
+  monorepo that is about 1.3 s per hunk header, the heap grows with each, and
+  a 90-hunk diff exhausted it before the first model call. :func:`escape_at`
+  puts a backslash before every ``@`` so the parser skips it; the model is
+  told what the backslash means, and :func:`unescape_at` restores its output. The settings also turn
+  the recursive lookup off, should an unescaped ``@`` ever get through.
 
 Authentication is Google Application Default Credentials only. The Vertex path
 does not honour ``GOOGLE_CLOUD_ACCESS_TOKEN`` (that is Code Assist's), so a
@@ -71,6 +84,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -161,7 +175,33 @@ so the number of turns, not the amount you read, is what this review costs.
 - Read a whole function or a generous window (about 150-300 lines) in one call
   instead of a run of adjacent small windows. Use read_many_files for several
   whole small files.
-- Do not narrate between tool calls; think, then call everything you need."""
+- Do not narrate between tool calls; think, then call everything you need.
+
+In the input above, every `@` is written as `\\@` (diff hunk headers included).
+That is an escape for the tool that delivers it, not part of the code: read it
+as `@`, and write a plain `@` in your answer."""
+
+#: An ``@`` the CLI's parser would take as an ``@path`` command. Its own pattern
+#: skips an ``@`` right after a backslash, so that is all escaping needs to add.
+_AT_COMMAND = re.compile(r"(?<!\\)@")
+_ESCAPED_AT = re.compile(r"(\\+)@")
+
+
+def escape_at(text: str) -> str:
+    """Escape every ``@`` the CLI would expand as an ``@path`` command."""
+    return _AT_COMMAND.sub(r"\\@", text)
+
+
+def unescape_at(text: str) -> str:
+    """Undo an escape the model copied from its input into its answer.
+
+    An odd run of backslashes before ``@`` loses one, so an escaped ``@`` reads
+    ``@`` whether it sits in prose or inside a JSON string, where the escape
+    would not even parse. An even run is an escaped backslash and is left alone.
+    """
+    return _ESCAPED_AT.sub(
+        lambda m: m.group(1)[:-1] + "@" if len(m.group(1)) % 2 else m.group(0), text
+    )
 
 
 def helper_aliases(model: str) -> dict:
@@ -203,7 +243,11 @@ def harness_settings(max_turns: int, model: str = "") -> dict:
             "disableAutoUpdate": True,
             "disableUpdateNag": True,
         },
-        "context": {"loadMemoryFromIncludeDirectories": False},
+        "context": {
+            "loadMemoryFromIncludeDirectories": False,
+            # An unresolved @path is otherwise globbed for across every root.
+            "fileFiltering": {"enableRecursiveFileSearch": False},
+        },
         "model": {"maxSessionTurns": max_turns},
     }
     if model:
@@ -450,7 +494,7 @@ def run_review(
             "on this runner or switch this model entry to another provider"
         )
     home, run_env = _private_home(env, max_turns, model)
-    prompt = f"{prompt}\n\n{TOOL_GUIDANCE}"
+    prompt = f"{escape_at(prompt)}\n\n{TOOL_GUIDANCE}"
     # The fixed part every turn re-sends; the CLI reports no per-turn usage.
     print(
         f"fuko: agentic {model} prompt {len(prompt)} chars (~{len(prompt) // 4} tokens)",
@@ -516,7 +560,7 @@ def run_review(
         returncode = 1
     return HarnessResult(
         returncode=returncode,
-        text=outcome.text,
+        text=unescape_at(outcome.text),
         stderr=stderr,
         usage=outcome.usage,
         cost_usd=None,
