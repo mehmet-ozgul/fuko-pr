@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -205,6 +206,7 @@ def test_settings_pin_the_tool_registry_and_switch_off_the_load_vectors():
     assert s["advanced"]["ignoreLocalEnv"] is True
     assert s["telemetry"]["enabled"] is False
     assert s["privacy"]["usageStatisticsEnabled"] is False
+    assert s["context"]["fileFiltering"] == {"enableRecursiveFileSearch": False}
 
 
 def test_private_home_finds_the_laptop_adc_file_under_the_real_home(tmp_path, monkeypatch):
@@ -289,7 +291,7 @@ def fake_cli(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
 
-    def run(mode="ok", timeout=60):
+    def run(mode="ok", timeout=60, prompt="THE PROMPT"):
         env = {
             "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}",
             "HOME": str(tmp_path),
@@ -298,7 +300,7 @@ def fake_cli(tmp_path):
             "GOOGLE_CLOUD_PROJECT": "p1",
         }
         result = gh.run_review(
-            "THE PROMPT", repo, cwd=cwd, model="gemini-x", env=env, timeout=timeout, max_turns=7
+            prompt, repo, cwd=cwd, model="gemini-x", env=env, timeout=timeout, max_turns=7
         )
         seen = json.loads(record.read_text()) if record.exists() else None
         return result, seen
@@ -380,3 +382,25 @@ def test_a_metadata_host_outranks_the_laptop_adc_file(tmp_path, monkeypatch):
         import shutil
 
         shutil.rmtree(home)
+
+
+def test_every_at_is_escaped_so_the_cli_never_expands_one():
+    diff = "@@ -1,2 +1,3 @@ func\n+// see @mod/CLAUDE.md, a@b and \\@kept\n"
+    escaped = gh.escape_at(diff)
+    # The CLI's own pattern: an @ not preceded by a backslash is a command.
+    assert re.search(r"(?<!\\)@", escaped) is None
+    assert escaped.replace("\\@", "@") == diff.replace("\\@", "@")
+
+
+def test_the_models_copy_of_an_escape_is_undone_in_prose_and_json():
+    assert gh.unescape_at("cc \\@team at \\@@ -1 +1 \\@@") == "cc @team at @@ -1 +1 @@"
+    raw = '{"title": "x \\@y", "body": "a\\\\@b"}'
+    # \@ alone is not even valid JSON; the even run is an escaped backslash.
+    assert json.loads(gh.unescape_at(raw)) == {"title": "x @y", "body": "a\\@b"}
+
+
+def test_run_review_sends_the_prompt_escaped_and_returns_plain_text(fake_cli, monkeypatch):
+    monkeypatch.setattr(gh, "unescape_at", lambda text: f"<{text}>")
+    result, seen = fake_cli(prompt="@@ -1 +1 @@ see @mod/CLAUDE.md")
+    assert seen["prompt"].startswith("\\@\\@ -1 +1 \\@\\@ see \\@mod/CLAUDE.md\n\n")
+    assert result.text == "<FINAL>"
