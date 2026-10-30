@@ -1,6 +1,7 @@
 """Per-repo reviewer-health observations, shared across runs via Postgres.
 
-The runner records what each external reviewer (CodeRabbit, Copilot) was last
+The runner records what each external reviewer (CodeRabbit, Copilot, Cursor
+Bugbot) was last
 seen doing at the end of every review, and reads those observations at the
 start of the next one -- the persistence layer behind next-round escalation
 (:func:`sidecar.status.escalation_needed`). Keyed per repo because reviewer
@@ -49,7 +50,7 @@ def all_states() -> list[dict]:
 
     The viewer's system-health section wants the whole fleet at a glance;
     :func:`states` stays the per-repo read the runner uses. Bounded (500 rows
-    = 250 repos at two reviewers each) so the read can never grow unbounded
+    = 166 repos at three reviewers each) so the read can never grow unbounded
     with fleet size.
     """
     if not _enabled():

@@ -5,6 +5,7 @@ import pytest
 from sidecar.signals import RunReceipt, with_run_receipt
 from sidecar.status import (
     DEGRADED_STATES,
+    bugbot_state,
     coderabbit_state,
     copilot_state,
     escalation_needed,
@@ -755,16 +756,17 @@ def test_copilot_none():
 # --- reviewer_states ----------------------------------------------------------
 
 
-def test_reviewer_states_returns_both():
+def test_reviewer_states_returns_every_external_bot():
     rows = reviewer_states(
         HEAD,
         [_walk(HEAD, posted=1)],
         [
             {"user": {"login": "Copilot"}, "commit_id": HEAD, "state": "APPROVED"},
             _cr_review(HEAD),
+            {"user": {"login": "cursor[bot]"}, "commit_id": HEAD, "state": "COMMENTED"},
         ],
     )
-    assert [r["backend"] for r in rows] == ["coderabbit", "copilot"]
+    assert [r["backend"] for r in rows] == ["coderabbit", "copilot", "bugbot"]
     assert all(r["state"] == "done" for r in rows)
 
 
@@ -1261,6 +1263,7 @@ def test_reviewer_states_includes_fuko_rows_by_default():
     assert [r["backend"] for r in rows] == [
         "coderabbit",
         "copilot",
+        "bugbot",
         "fuko:openrouter/x-ai/grok-4.5",
     ]
 
@@ -1288,3 +1291,46 @@ def test_failure_on_the_current_head_still_escalates():
     rows = fuko_states(HEAD, [_receipt_comment(state="failed", head_sha=HEAD)])
     assert rows[0]["state"] == "unavailable"
     assert escalation_needed(rows) is True
+
+
+# --- Cursor Bugbot -------------------------------------------------------------
+
+
+def _bugbot_check(status, conclusion=None):
+    return _check(status, conclusion, name="Cursor Bugbot", slug="cursor")
+
+
+def _bugbot_review(commit_id):
+    return {"user": {"login": "cursor[bot]"}, "commit_id": commit_id, "state": "COMMENTED"}
+
+
+@pytest.mark.parametrize("status", ["queued", "in_progress"])
+def test_bugbot_in_progress_while_its_check_runs(status):
+    s = bugbot_state(HEAD, [_bugbot_review(HEAD)], [_bugbot_check(status)])
+    assert s["state"] == "in_progress"
+
+
+@pytest.mark.parametrize("conclusion", ["success", "neutral"])
+def test_bugbot_done_when_its_check_completes(conclusion):
+    s = bugbot_state(HEAD, [], [_bugbot_check("completed", conclusion)])
+    assert (s["state"], s["head_reviewed"]) == ("done", HEAD)
+    assert conclusion in s["detail"]
+
+
+def test_bugbot_failed_check_is_unavailable():
+    s = bugbot_state(HEAD, [], [_bugbot_check("completed", "failure")])
+    assert s["state"] == "unavailable"
+    assert escalation_needed([s])
+
+
+def test_bugbot_ignores_other_checks_and_falls_back_to_reviews():
+    other = _check("in_progress", name="ci/build", slug="github-actions")
+    assert bugbot_state(HEAD, [_bugbot_review(HEAD)], [other])["state"] == "done"
+    assert bugbot_state(HEAD, [_bugbot_review("old111")], [other])["state"] == "pending"
+    assert bugbot_state(HEAD, [_cr_review(HEAD)], [other])["state"] == "none"
+
+
+def test_reviewer_states_threads_check_runs_to_bugbot():
+    rows = reviewer_states(HEAD, [], [], [_bugbot_check("in_progress")])
+    bugbot = next(r for r in rows if r["backend"] == "bugbot")
+    assert bugbot["state"] == "in_progress"

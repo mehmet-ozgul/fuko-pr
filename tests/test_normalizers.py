@@ -10,6 +10,7 @@ from sidecar.backends import pragent
 from sidecar.backends.base import PRRef
 from sidecar.backends.pragent import PrAgentBackend
 from sidecar.normalizers import (
+    bugbot_signal,
     coderabbit_signal,
     collect_issue_comment_signals,
     collect_review_signals,
@@ -17,6 +18,8 @@ from sidecar.normalizers import (
     copilot_signal,
     copilot_suppressed_signals,
     guide_signals,
+    is_bugbot_comment,
+    is_bugbot_finding,
     is_coderabbit_comment,
     is_coderabbit_finding,
     is_copilot_comment,
@@ -1083,3 +1086,101 @@ def test_normalize_output_degrades_when_issue_fetch_fails(monkeypatch, capsys):
     sigs = PrAgentBackend().normalize_output(PRRef("o/r", 8, "u"), model="m")
     assert [s.file for s in sigs] == ["src/lib/breakLogic.ts"]  # inline survives
     assert "could not read issue comments" in capsys.readouterr().err
+
+
+# --- Cursor Bugbot ------------------------------------------------------------
+# Same structure as live Bugbot comments; the text, paths and the "Fix in Cursor"
+# link payloads (which carry per-finding keys) are not copied.
+
+_BUGBOT_FIX_LINKS = (
+    '<div><a href="https://cursor.com/open?link=REDACTED"><picture>'
+    '<img alt="Fix in Cursor" src="https://cursor.com/assets/images/fix-in-cursor-dark.png">'
+    "</picture></a></div>"
+)
+
+BUGBOT = {
+    "id": 4400,
+    "path": "app/billing.py",
+    "line": None,
+    "start_line": None,
+    "original_line": 52,
+    "html_url": "https://github.com/o/r/pull/9#discussion_r4400",
+    "user": {"login": "cursor[bot]"},
+    "body": (
+        "### Discount applied twice on renewal\n\n"
+        "**High Severity**\n\n"
+        "<!-- DESCRIPTION START -->\n"
+        "`renew()` calls `apply_discount` and then `price_for`, which applies it again, "
+        "so renewals are charged below the plan price.\n"
+        "<!-- DESCRIPTION END -->\n\n"
+        "<!-- BUGBOT_BUG_ID: 0f1e2d3c-aaaa-bbbb-cccc-1234567890ab -->\n\n"
+        "<!-- LOCATIONS START\n"
+        "app/billing.py#L48-L55\n"
+        "app/pricing.py#L10-L12\n"
+        "LOCATIONS END -->\n"
+        "<details>\n<summary>Additional Locations (1)</summary>\n\n"
+        "- [`app/pricing.py#L10-L12`](https://github.com/o/r/blob/abc/app/pricing.py#L10-L12)\n"
+        "\n</details>\n\n"
+        f"{_BUGBOT_FIX_LINKS}\n\n\n"
+        "<sup>Reviewed by [Cursor Bugbot](https://cursor.com/bugbot) for commit abc. "
+        "Configure [here](https://www.cursor.com/dashboard/bugbot).</sup>"
+    ),
+}
+
+
+def test_is_bugbot_comment_and_finding():
+    assert is_bugbot_comment(BUGBOT)
+    assert is_bugbot_finding(BUGBOT["body"])
+    assert not is_bugbot_comment(COPILOT)
+    assert not is_bugbot_finding("Cursor background agent finished the task.")
+
+
+def test_bugbot_signal_declared_fields():
+    sig = bugbot_signal(BUGBOT)
+    assert sig.backend == "bugbot"
+    assert sig.title == "Discount applied twice on renewal"
+    assert (sig.severity, sig.severity_source) == ("high", "declared")
+    assert sig.category == "bug"
+    assert sig.thread_url == BUGBOT["html_url"]
+
+
+def test_bugbot_outdated_comment_takes_its_line_from_locations():
+    """GitHub nulls `line` once a push outdates the comment; Bugbot's block still has it."""
+    sig = bugbot_signal(BUGBOT)
+    assert (sig.file, sig.line, sig.end_line) == ("app/billing.py", 48, 55)
+
+
+def test_bugbot_anchored_comment_keeps_the_github_line():
+    sig = bugbot_signal(dict(BUGBOT, line=50))
+    assert (sig.line, sig.end_line) == (50, None)
+
+
+def test_bugbot_body_drops_the_fix_links_and_footer():
+    sig = bugbot_signal(BUGBOT)
+    assert sig.body.startswith("### Discount applied twice on renewal\n\n**High Severity**")
+    assert "renewals are charged below the plan price" in sig.body
+    assert "cursor.com" not in sig.body
+    assert "BUGBOT_BUG_ID" not in sig.body
+
+
+@pytest.mark.parametrize(
+    ("label", "severity", "source"),
+    [("Low", "low", "declared"), ("Medium", "medium", "declared"), ("Bogus", "medium", "inferred")],
+)
+def test_bugbot_severity_mapping(label, severity, source):
+    body = BUGBOT["body"].replace("**High Severity**", f"**{label} Severity**")
+    sig = bugbot_signal(dict(BUGBOT, body=body))
+    assert (sig.severity, sig.severity_source) == (severity, source)
+
+
+def test_bugbot_security_finding_infers_security():
+    body = BUGBOT["body"].replace("so renewals", "so an attacker can replay it and renewals")
+    assert bugbot_signal(dict(BUGBOT, body=body)).category == "security"
+
+
+def test_collect_signals_includes_bugbot_findings_only():
+    other = dict(BUGBOT, id=4401, body="Cursor background agent finished the task.")
+    signals = collect_signals([COPILOT, BUGBOT, other], model="m")
+    assert [s.backend for s in signals] == ["copilot", "bugbot"]
+    # A cursor[bot] comment without a bug id is claimed and skipped, not unreadable.
+    assert unrecognized_comments([other], model="m") == []

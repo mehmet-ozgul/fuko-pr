@@ -600,7 +600,7 @@ def _observe_reviewer_health(pr: PRRef, token: str, api_url: str) -> None:
 
     Called at the end of a review run so the NEXT round can escalate on what
     this one saw (next-round escalation). Fetches the PR artifacts fresh --
-    CodeRabbit/Copilot typically post while fuko's own review runs -- and
+    CodeRabbit/Copilot/Bugbot typically post while fuko's own review runs -- and
     persists via the sidecar or the local Postgres. Every failure is swallowed:
     an observation must never fail the review that produced it.
     """

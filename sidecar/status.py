@@ -6,7 +6,8 @@ for the bots a review loop gates on. It is the state counterpart to
 artifacts are read — fuko makes no time judgments like "unresponsive"; a
 consumer applies its own timeout to a `pending` state.
 
-Two kinds of reviewer are reported. **External** bots (CodeRabbit, Copilot) are
+Two kinds of reviewer are reported. **External** bots (CodeRabbit, Copilot,
+Cursor Bugbot) are
 read from the artifacts they happen to leave behind, which is why each needs its
 own heuristic below. **fuko's own instances** are read from the run receipts
 they write deliberately (`fuko_states`), so their coverage is a recorded fact
@@ -19,6 +20,7 @@ the inline comments (issue #17). Its walkthrough issue comment is the fallback w
 no check-run is observable, and only a *terminal* walkthrough marker (a completion
 line, not merely the "Reviewing files … between …" range that CR posts up front)
 counts as done there. Copilot's state is its latest review's `commit_id`.
+Bugbot's is its "Cursor Bugbot" check on HEAD, else its latest review's `commit_id`.
 
 Both of CodeRabbit's completion signals are emitted under a Fair-Usage limit too,
 on a commit CR never read, so a live limit or pause notice in CR's in-place-edited
@@ -51,6 +53,8 @@ State = Literal[
 DEGRADED_STATES: frozenset[str] = frozenset({"rate_limited", "paused", "unavailable", "degraded"})
 
 _CR_LOGIN = "coderabbitai[bot]"
+_BUGBOT_LOGIN = "cursor[bot]"
+_BUGBOT_CHECK_NAMES = re.compile(r"bugbot", re.I)
 _COPILOT_LOGINS = {"copilot", "copilot-pull-request-reviewer[bot]"}
 _COPILOT_QUOTA = re.compile(
     r"wasn't able to review"
@@ -617,6 +621,46 @@ def copilot_state(
     )
 
 
+def _bugbot_check(check_runs: list[dict] | None) -> dict | None:
+    """Return Bugbot's check-run ("Cursor Bugbot", app ``cursor``) from ``check_runs``."""
+    for c in check_runs or []:
+        name = c.get("name", "") or ""
+        slug = ((c.get("app") or {}).get("slug")) or ""
+        if _BUGBOT_CHECK_NAMES.search(name) or slug.lower() == "cursor":
+            return c
+    return None
+
+
+def bugbot_state(head_sha: str, reviews: list[dict], check_runs: list[dict] | None = None) -> dict:
+    """Derive Cursor Bugbot's state on ``head_sha``.
+
+    Bugbot runs as a check on the HEAD commit, which is the authoritative signal
+    when present: queued or in progress until it posts, then completed with
+    ``success`` (no issues) or ``neutral`` (issues posted inline). A completed
+    check with any other conclusion means it did not deliver a review of HEAD,
+    which is ``unavailable``. Without an observable check, its latest review's
+    ``commit_id`` decides, as for Copilot.
+    """
+    check = _bugbot_check(check_runs)
+    if check is not None:
+        status = (check.get("status") or "").lower()
+        conclusion = (check.get("conclusion") or "").lower()
+        if status != "completed":
+            return _row("bugbot", "in_progress", head_sha, f"check {status or 'pending'}")
+        if conclusion in ("success", "neutral"):
+            return _row("bugbot", "done", head_sha, f"check completed ({conclusion})")
+        return _row("bugbot", "unavailable", None, f"check completed ({conclusion or 'none'})")
+
+    bbs = [r for r in reviews if (r.get("user") or {}).get("login", "").lower() == _BUGBOT_LOGIN]
+    if any(r.get("commit_id") == head_sha for r in bbs):
+        return _row("bugbot", "done", head_sha, "review on HEAD")
+    if not bbs:
+        return _row("bugbot", "none", None, "no Bugbot review")
+    return _row(
+        "bugbot", "pending", bbs[-1].get("commit_id"), "latest Bugbot review is on an older commit"
+    )
+
+
 def fuko_states(
     head_sha: str,
     issue_comments: list[dict],
@@ -828,7 +872,7 @@ def reviewer_states(
 ) -> list[dict]:
     """Return the normalized state of each reviewer on ``head_sha``.
 
-    Covers the external bots (CodeRabbit, Copilot) and, when ``include_fuko`` is
+    Covers the external bots (CodeRabbit, Copilot, Cursor Bugbot) and, when ``include_fuko`` is
     set, fuko's own instances via :func:`fuko_states`. ``check_runs`` are the
     check-runs fetched for ``head_sha``; CodeRabbit's completion is read from its
     own check there when present (issue #17). Both are optional so existing
@@ -847,6 +891,7 @@ def reviewer_states(
     rows = [
         coderabbit_state(head_sha, issue_comments, reviews, check_runs),
         copilot_state(head_sha, reviews, issue_comments),
+        bugbot_state(head_sha, reviews, check_runs),
     ]
     if include_fuko:
         rows.extend(

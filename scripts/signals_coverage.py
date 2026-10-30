@@ -5,7 +5,7 @@ and match the resulting signals back to comments by ``thread_url``. Report, per
 PR, how many *top-level* bot findings exist versus how many became signals, and
 list any that were MISSED — a finding a reviewer posted that fuko did not
 normalize. A clean run (no misses) is evidence the normalizers still track what
-CodeRabbit / Copilot / PR-Agent actually post; misses flag drift to fix (e.g. a
+CodeRabbit / Copilot / Bugbot / PR-Agent actually post; misses flag drift to fix (e.g. a
 vendor changed its comment format).
 
 This is a maintenance tool, not part of the runtime. It needs fuko-pr installed
@@ -30,12 +30,14 @@ from sidecar.backends.base import PRRef
 from sidecar.normalizers import (
     collect_signals,
     is_coderabbit_comment,
+    is_bugbot_comment,
+    is_bugbot_finding,
     is_coderabbit_finding,
     is_copilot_comment,
     is_pragent_comment,
 )
 
-_BOT_MARKERS = ("coderabbit", "copilot", "fuko-")
+_BOT_MARKERS = ("coderabbit", "copilot", "cursor", "fuko-")
 
 
 def _token() -> str:
@@ -59,6 +61,8 @@ def _skip_reason(comment: dict) -> str:
         return ""
     if is_coderabbit_comment(comment):
         return "" if is_coderabbit_finding(body) else "cr-no-classification"
+    if is_bugbot_comment(comment):
+        return "" if is_bugbot_finding(body) else "bugbot-no-bug-id"
     return "unrecognized"
 
 
