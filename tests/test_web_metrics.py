@@ -38,7 +38,15 @@ _HEALTH = [
         "observed_at": "2026-07-22T20:16:00+00:00",
         "pr": 74,
         "detail": "rate-limit notice",
-    }
+    },
+    {
+        "repo": "lemehmet/shuanda",
+        "reviewer": "bugbot",
+        "state": "done",
+        "observed_at": "2026-07-22T20:16:00+00:00",
+        "pr": 74,
+        "detail": "check completed (neutral)",
+    },
 ]
 
 
@@ -70,6 +78,7 @@ def test_view_is_open_without_auth_and_renders_all_sections(monkeypatch):
     resp = client.get("/ui/metrics")
     assert resp.status_code == 200
     page = resp.text
+    assert "bugbot" in page
     assert "x-ai/grok-4.5" in page and "25.1" in page
     assert "sybil" in page
     assert 'href="https://github.com/lemehmet/shuanda/pull/74"' in page
