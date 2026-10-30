@@ -1,7 +1,7 @@
 # fuko Review Signal v1
 
 A small, stable schema for one PR-review finding. Every reviewer fuko knows about
-(PR-Agent, Copilot, CodeRabbit) is normalized into this shape, so a consumer reads
+(PR-Agent, Copilot, CodeRabbit, Cursor Bugbot) is normalized into this shape, so a consumer reads
 **one** deterministic format instead of sniffing each vendor's ad-hoc markdown.
 
 `fuko signals --pr-url <url>` emits a JSON array of these for a pull request.
@@ -22,7 +22,7 @@ A small, stable schema for one PR-review finding. Every reviewer fuko knows abou
 | `body` | string | Full finding text (the human-facing comment). |
 | `suggestion` | bool | Whether the finding carries an applicable code suggestion. |
 | `thread_url` | string \| null | Where to reply / resolve. |
-| `backend` | string | `pr-agent` \| `copilot` \| `coderabbit`. |
+| `backend` | string | `pr-agent` \| `copilot` \| `coderabbit` \| `bugbot`. |
 | `model` | string | Review model id when known (e.g. `anthropic/claude-sonnet-4-6`), else `""`. |
 | `kb_refs` | string[] | Knowledge-base learnings that drove the finding, when known. |
 
@@ -56,6 +56,11 @@ comment.
 - **CodeRabbit** — detected by author **and** a finding classification line
   (`_⚠️ Potential issue_ | _🔴 Critical_`); its chat replies and rate-limit
   notices carry no classification and are skipped. Severity/category are `declared`.
+- **Cursor Bugbot** — detected by author (`cursor[bot]`) **and** a
+  `<!-- BUGBOT_BUG_ID: … -->` comment; other `cursor[bot]` comments are skipped.
+  Severity is `declared` (`**High Severity**`), category is inferred. The body keeps
+  the title, severity and description and drops the "Fix in Cursor" links. An
+  outdated comment (GitHub `line` is null) takes its line from Bugbot's LOCATIONS block.
 
 ## Run receipts (`fuko-run:v1`) — coverage, not findings
 
@@ -88,8 +93,8 @@ The receipt is written when the branch starts and **rewritten in place** when it
 ends, so there is exactly one receipt per instance per PR — a consumer reads
 coverage without deduplicating.
 
-`fuko status` surfaces these as `fuko:<label>` rows alongside the CodeRabbit and
-Copilot rows. Every ambiguous case reports as *not* `done`:
+`fuko status` surfaces these as `fuko:<label>` rows alongside the CodeRabbit,
+Copilot and Bugbot rows. Every ambiguous case reports as *not* `done`:
 
 - a receipt stuck at `in_progress` (the branch died before finalizing) stays
   `in_progress`, so the consumer's own timeout governs rather than an implied

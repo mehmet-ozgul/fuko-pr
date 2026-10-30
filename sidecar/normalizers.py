@@ -4,8 +4,8 @@ Pure parsing functions, one family per vendor, kept separate from the GitHub I/O
 that fetches/edits comments. A consumer reads one schema (:class:`ReviewSignal`)
 instead of sniffing each vendor's ad-hoc markdown.
 
-PR-Agent declares structured metadata (a ``[label, importance: N]`` tag), so its
-severity/category are ``declared``; free-form reviewers (e.g. Copilot) get a
+PR-Agent, CodeRabbit and Cursor Bugbot declare a severity, so theirs is
+``declared``; free-form reviewers (e.g. Copilot) get a
 best-effort ``inferred`` mapping. Detection is by comment *format*, not author --
 PR-Agent posts under whatever token runs it (an app bot in CI, a human PAT locally).
 """
@@ -342,6 +342,80 @@ def coderabbit_signal(comment: dict) -> ReviewSignal:
     )
 
 
+_BUGBOT_LOGIN = "cursor[bot]"
+# Every Bugbot finding carries a bug id comment. The `cursor[bot]` login is shared
+# with Cursor's other GitHub features, so the id, not the author, marks a finding.
+_BUGBOT_ID_RE = re.compile(r"<!--\s*BUGBOT_BUG_ID:\s*([\w-]+)\s*-->")
+_BUGBOT_TITLE_RE = re.compile(r"^###\s+(.+?)\s*$", re.M)
+_BUGBOT_SEVERITY_RE = re.compile(r"^\*\*(\w+) Severity\*\*\s*$", re.M | re.I)
+_BUGBOT_DESCRIPTION_RE = re.compile(
+    r"<!--\s*DESCRIPTION START\s*-->(.*?)<!--\s*DESCRIPTION END\s*-->", re.S
+)
+# The primary location is the first `path#Lstart-Lend` line of the LOCATIONS block.
+_BUGBOT_LOCATION_RE = re.compile(
+    r"<!--\s*LOCATIONS START\s*\n\s*(?P<path>[^\s#]+)#L(?P<start>\d+)(?:-L(?P<end>\d+))?"
+)
+_BUGBOT_SEVERITY = {"critical": "critical", "high": "high", "medium": "medium", "low": "low"}
+
+
+def is_bugbot_comment(comment: dict) -> bool:
+    """Return whether ``comment`` was authored by Cursor's GitHub app (Bugbot)."""
+    return (comment.get("user") or {}).get("login", "").lower() == _BUGBOT_LOGIN
+
+
+def is_bugbot_finding(body: str) -> bool:
+    """Return whether a ``cursor[bot]`` comment body is a Bugbot finding."""
+    return _BUGBOT_ID_RE.search(body or "") is not None
+
+
+def bugbot_signal(comment: dict) -> ReviewSignal:
+    """Map one Cursor Bugbot inline finding to a Review Signal (severity declared).
+
+    The body keeps the heading, severity and description and drops the "Fix in
+    Cursor" buttons and footer, which are links, not review content. When GitHub
+    no longer anchors the comment (``line`` is null once a later push outdates
+    it), the line comes from Bugbot's own LOCATIONS block.
+    """
+    body = comment.get("body", "") or ""
+    path = comment.get("path")
+    line = comment.get("start_line") or comment.get("line")
+    end_line = comment.get("line") if comment.get("start_line") else None
+    location = _BUGBOT_LOCATION_RE.search(body)
+    if line is None and location and (path is None or location.group("path") == path):
+        path = location.group("path")
+        line = int(location.group("start"))
+        end = location.group("end")
+        end_line = int(end) if end and end != location.group("start") else None
+
+    heading = _BUGBOT_TITLE_RE.search(body)
+    title = (heading.group(1) if heading else body.strip().split("\n", 1)[0])[:200]
+    declared = _BUGBOT_SEVERITY_RE.search(body)
+    severity = _BUGBOT_SEVERITY.get(declared.group(1).lower()) if declared else None
+    description = _BUGBOT_DESCRIPTION_RE.search(body)
+    text = description.group(1).strip() if description else body
+    if description:
+        parts = [f"### {title}", declared.group(0) if declared else "", text]
+        clean = "\n\n".join(p for p in parts if p)
+    else:
+        clean = body
+
+    return ReviewSignal(
+        id=make_id(path or "", str(line or ""), title),
+        file=path,
+        line=line,
+        end_line=end_line,
+        severity=severity or "medium",
+        severity_source="declared" if severity else "inferred",
+        category=_infer_category(f"{title}\n{text}"),
+        title=title,
+        body=clean,
+        suggestion="```suggestion" in body,
+        thread_url=comment.get("html_url"),
+        backend="bugbot",
+        model="",
+    )
+
+
 _GUIDE_HEADER = "PR Reviewer Guide"
 _GUIDE_SECURITY_CELL = "<strong>Security concerns</strong>"
 _GUIDE_FOCUS_CELL = "<strong>Recommended focus areas for review</strong>"
@@ -543,6 +617,11 @@ def normalize_inline_comment(comment: dict, model: str = "") -> ReviewSignal | N
         if not is_coderabbit_finding(body):
             return None
         return _prefer_marker(coderabbit_signal(comment), body)
+    if is_bugbot_comment(comment):
+        # Cursor's app also posts things that are not Bugbot findings.
+        if not is_bugbot_finding(body):
+            return None
+        return _prefer_marker(bugbot_signal(comment), body)
     if is_pragent_comment(body):
         return _prefer_marker(pragent_signal(comment, model), body)
     return _marker_only_signal(comment, body)
@@ -556,7 +635,10 @@ def is_recognized_author(comment: dict) -> bool:
     on unreadable comments need that distinction -- a recognized-and-skipped
     comment is working as designed, an unclaimed one is the blind spot.
     """
-    return is_copilot_comment(comment) or is_coderabbit_comment(comment)
+    return any(
+        recognizer(comment)
+        for recognizer in (is_copilot_comment, is_coderabbit_comment, is_bugbot_comment)
+    )
 
 
 def collect_signals(comments: list[dict], model: str = "") -> list[ReviewSignal]:
