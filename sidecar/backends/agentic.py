@@ -35,7 +35,7 @@ import random
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 from shutil import rmtree
@@ -74,9 +74,11 @@ from ..reviewer.harness import (
     usage_tokens,
 )
 from ..reviewer.ledger import DEFAULT_SEAT, CarriedState, carry_in, settle
+from ..reviewer.peers import FUKO_REVIEW_HEADER, fetch_peer_activity, render_already_raised
 from ..reviewer.prompt import (
     MAX_FINDINGS,
     AgenticFinding,
+    AlreadyRaised,
     ReviewParseError,
     build_prompt,
     parse_review,
@@ -87,7 +89,7 @@ from ..throttle import TIMEOUT_RETURNCODE, is_throttle
 from .base import ENV_SEAT, InvokeResult, PRRef
 
 #: The heading every agentic review body opens with.
-_REVIEW_HEADER = "## fuko agentic review"
+_REVIEW_HEADER = FUKO_REVIEW_HEADER
 
 #: The one output channel this backend publishes on today: a single holistic
 #: review (a PR-level summary plus inline findings). Named explicitly rather than
@@ -673,6 +675,8 @@ class _PendingReview:
     run_id: str = ""
     round: int | None = None
     examined: int = 0
+    #: The round's verdicts on what other reviewers already posted.
+    already_raised: list[AlreadyRaised] = field(default_factory=list)
 
 
 class AgenticBackend:
@@ -1333,12 +1337,21 @@ class AgenticBackend:
                 coverage_ledger=coverage_ledger,
                 findings_ledger=findings_ledger,
             )
+            # Best effort: a review without the dedup section is still a review.
+            try:
+                already_raised = render_already_raised(
+                    *fetch_peer_activity(pr.repo, pr.number, token=token, api_url=api_url)
+                )
+            except httpx.HTTPError as e:
+                print(f"fuko: already-raised section skipped: {e}", file=sys.stderr)
+                already_raised = ""
             prompt = build_prompt(
                 ctx,
                 env.get(_ENV_INSTRUCTIONS, ""),
                 checkout_root=str(checkout),
                 knowledge=env.get(_ENV_KNOWLEDGE, ""),
                 prior_state=carried.text,
+                already_raised=already_raised,
             )
             strip_agent_config(Path(checkout))
             # Minted at run START (#236): `run_metrics.record()` inserts the
@@ -1606,6 +1619,7 @@ class AgenticBackend:
                 run_id=(transcript_index or {}).get("key") or "",
                 round=carried.round,
                 examined=len(review.examined),
+                already_raised=list(review.already_raised),
             )
         # A COMPLETED run states its channel finished, rather than leaving an empty
         # map that `fuko_states` cannot tell from a dead channel (#113). This is the
@@ -1725,6 +1739,7 @@ class AgenticBackend:
                     examined=stash.examined,
                     withheld_low=stash.withheld_low,
                     over_cap=stash.over_cap,
+                    already_raised=tuple(stash.already_raised),
                 ),
                 human_findings=self.human_findings,
                 anchorable=lambda f: self._anchorable(stash, f),

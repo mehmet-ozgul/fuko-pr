@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from importlib import metadata
 
 from ..signals import ReviewSignal, encode_marker, with_marker
-from .prompt import AgenticFinding
+from .prompt import AgenticFinding, AlreadyRaised
 
 #: Most severe first. Anything off-vocabulary sorts last.
 SEVERITY_ORDER = ("critical", "high", "medium", "low", "info")
@@ -66,6 +66,7 @@ class RunFacts:
     examined: int = 0
     withheld_low: int = 0
     over_cap: int = 0
+    already_raised: tuple[AlreadyRaised, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -106,9 +107,9 @@ def rank(
 def finding_v1(f: AgenticFinding, signal: ReviewSignal, pr: int, facts: RunFacts) -> dict:
     """One finding in the Finding v1 shape, as far as this reviewer's output fills it.
 
-    Fields the output contract does not ask for yet (``symbol``,
-    ``failure_sequence``, ``proposed_fix``, ``verify_cmd``) are left out rather
-    than emitted empty, so a consumer can tell "not produced" from "nothing to say".
+    Fields the output contract does not ask for (``symbol``), or that the model
+    left empty, are left out rather than emitted empty, so a consumer can tell
+    "not produced" from "nothing to say".
     """
     record = {
         "schema": "finding/v1",
@@ -127,9 +128,13 @@ def finding_v1(f: AgenticFinding, signal: ReviewSignal, pr: int, facts: RunFacts
         "claim": f.title,
         "detail": f.body,
         "evidence": f.evidence,
+        "failure_sequence": f.failure_sequence,
+        "proposed_fix": f.proposed_fix,
+        "verify_cmd": f.verify_cmd,
+        "regression_test": f.regression_test,
         "state": "open",
     }
-    return {k: v for k, v in record.items() if v is not None}
+    return {k: v for k, v in record.items() if v is not None and v != ""}
 
 
 def _fence(content: str) -> tuple[str, str]:
@@ -142,12 +147,34 @@ def _where(f: AgenticFinding) -> str:
     return f"`{f.file}`" + (f":{f.line}" if f.line is not None else "")
 
 
-def _verdict(findings: Sequence[AgenticFinding]) -> str:
-    if not findings:
-        return "**Verdict:** no material findings."
-    serious = sum(1 for f in findings if f.severity in ("critical", "high"))
-    noun = "finding" if len(findings) == 1 else "findings"
-    return f"**Verdict:** {len(findings)} {noun}, {serious} rated high or critical."
+def _label(f: AgenticFinding) -> str:
+    return f"{SEVERITY_V1.get(f.severity, 'nit')}/{f.confidence}"
+
+
+def _verdict(findings: Sequence[AgenticFinding], head_sha: str) -> str:
+    """The skill's verdict vocabulary, minus "approve": automation never approves."""
+    head = f" · head `{head_sha[:10]}`"
+    counts = {
+        label: sum(1 for f in findings if SEVERITY_V1.get(f.severity, "nit") == label)
+        for label in ("blocking", "fix-before-merge", "fast-follow", "nit")
+    }
+    if not any(counts[k] for k in ("blocking", "fix-before-merge", "fast-follow")):
+        nits = " Nits are in the section below." if counts["nit"] else ""
+        return f"**Verdict:** no material findings{head}.{nits}"
+    word = "needs changes" if counts["blocking"] else "advisory findings"
+    parts = ", ".join(f"{n} {label}" for label, n in counts.items() if n)
+    return f"**Verdict:** {word} ({parts}){head}."
+
+
+def _already_raised_lines(verdicts: Sequence[AlreadyRaised]) -> list[str]:
+    if not verdicts:
+        return []
+    lines = ["**Already raised by other reviewers, checked at this head:**", ""]
+    for v in verdicts:
+        reason = f" — {defang(v.reason)}" if v.reason else ""
+        status = defang(v.status) or "?"
+        lines.append(f"- {defang(v.source) or '?'}: {defang(v.title)} → **{status}**{reason}")
+    return lines + [""]
 
 
 def render_two_part(
@@ -165,7 +192,10 @@ def render_two_part(
     because the post's read-back recognises our own review by it.
     """
     ranked = rank(pairs)
-    shown, rest = ranked[:human_findings], ranked[human_findings:]
+    # Nits never reach the human section; they stay in the collapsed one.
+    material = [pair for pair in ranked if SEVERITY_V1.get(pair[0].severity, "nit") != "nit"]
+    shown = material[:human_findings]
+    rest = [pair for pair in ranked if pair not in shown]
     findings = [f for f, _ in ranked]
 
     run = f", run `{facts.run_id}`" if facts.run_id else ""
@@ -177,7 +207,7 @@ def render_two_part(
         "",
         header,
         "",
-        _verdict(findings),
+        _verdict(findings, facts.head_sha),
         "",
         f"**What was done:** read-only review of `{facts.head_sha[:10]}`. Nothing was built, "
         "run or tested"
@@ -191,10 +221,7 @@ def render_two_part(
         text = defang(f.body)
         evidence = f" *Verified against:* {defang(f.evidence)}" if f.evidence else ""
         anchored = f.line is not None and anchorable(f)
-        entry = (
-            f"{number}. **{f.severity}** · confidence {f.confidence} · {_where(f)} — "
-            f"**{defang(f.title)}**"
-        )
+        entry = f"{number}. **[{_label(f)}]** {_where(f)} — **{defang(f.title)}**"
         # An anchored finding's detail is in its inline comment; repeating it here
         # would have people read every finding twice.
         lines += (
@@ -216,24 +243,29 @@ def render_two_part(
     if facts.over_cap:
         lines += [f"*{facts.over_cap} further finding(s) cut by the per-review cap.*", ""]
 
-    if findings:
-        payload = json.dumps(
-            [finding_v1(f, signal, pr, facts) for f, signal in ranked], indent=1, ensure_ascii=False
+    if findings or facts.already_raised:
+        summary = (
+            f"all {len(findings)} findings as Finding v1 JSON"
+            if findings
+            else "what other reviewers already raised"
         )
-        payload = defang(payload)
-        opening, closing = _fence(payload)
         lines += [
             "<details>",
-            f"<summary>For the author's AI assistant: all {len(findings)} findings as "
-            "Finding v1 JSON</summary>",
+            f"<summary>For the author's AI assistant: {summary}</summary>",
             "",
             ASSISTANT_GUIDANCE,
             "",
-            opening,
-            payload,
-            closing,
-            "",
+            *_already_raised_lines(facts.already_raised),
         ]
+        if findings:
+            payload = json.dumps(
+                [finding_v1(f, signal, pr, facts) for f, signal in ranked],
+                indent=1,
+                ensure_ascii=False,
+            )
+            payload = defang(payload)
+            opening, closing = _fence(payload)
+            lines += [opening, payload, closing, ""]
         lines += [encode_marker(signal) for _, signal in rest]
         lines += ["</details>"]
     return Rendered(body="\n".join(lines).rstrip() + "\n", inline=inline)

@@ -11,7 +11,7 @@ from sidecar.backends.agentic import AgenticBackend, _PendingReview
 from sidecar.backends.base import PRRef
 from sidecar.fukoconfig import ReviewConfig, ReviewModel
 from sidecar.reviewer import comment
-from sidecar.reviewer.prompt import AgenticFinding
+from sidecar.reviewer.prompt import AgenticFinding, AlreadyRaised
 from sidecar.signals import ReviewSignal, extract_markers, make_id
 
 PR = PRRef(repo="o/r", number=9, url="https://github.com/o/r/pull/9")
@@ -122,7 +122,7 @@ def test_the_assistant_section_carries_every_finding_as_finding_v1():
 
 def test_no_findings_says_so_and_has_no_assistant_section():
     body = _render([]).body
-    assert "**Verdict:** no material findings." in body
+    assert "**Verdict:** no material findings · head `beefcafe12`." in body
     assert "<details>" not in body
     assert "read-only review of `beefcafe12`" in body
     assert "7 code regions were read" in body
@@ -207,3 +207,49 @@ def test_no_examined_regions_is_not_stated_as_zero():
     body = _render([], facts=facts).body
     assert "Nothing was built, run or tested." in body
     assert "code regions" not in body
+
+
+def test_findings_carry_the_skill_labels():
+    body = _render([_finding("A", severity="high", confidence="medium")]).body
+    assert "**[fix-before-merge/medium]** `src/app.py`:4 — **A**" in body
+    assert "**Verdict:** advisory findings (1 fix-before-merge) · head `beefcafe12`." in body
+
+
+def test_blocking_findings_say_needs_changes():
+    body = _render([_finding("A", severity="critical"), _finding("B", line=5)]).body
+    assert "**Verdict:** needs changes (1 blocking, 1 fast-follow)" in body
+
+
+def test_nits_never_reach_the_human_section():
+    rendered = _render([_finding("nit one", severity="low"), _finding("real", line=7)])
+    human = rendered.body.split("<details>")[0]
+    assert "nit one" not in human
+    assert [f.title for f, _ in rendered.inline] == ["real"]
+    assert "nit one" in rendered.body  # still in the collapsed section
+
+
+def test_only_nits_reads_as_no_material_findings():
+    body = _render([_finding("n", severity="low")]).body
+    assert "**Verdict:** no material findings · head `beefcafe12`. Nits are in" in body
+
+
+def test_finding_v1_carries_the_failure_sequence_and_fix_when_given():
+    f = _finding("A", failure_sequence="close then send", verify_cmd="go test ./x")
+    record = comment.finding_v1(f, _pair(f)[1], 9, FACTS)
+    assert record["failure_sequence"] == "close then send"
+    assert record["verify_cmd"] == "go test ./x"
+    assert "proposed_fix" not in record  # empty is absent, not ""
+
+
+def test_already_raised_verdicts_render_without_findings():
+    facts = comment.RunFacts(
+        model="m",
+        head_sha="beefcafe1234",
+        already_raised=(
+            AlreadyRaised(source="bugbot", title="double discount", status="fixed", reason="@x"),
+        ),
+    )
+    body = _render([], facts=facts).body
+    assert "<summary>For the author's AI assistant: what other reviewers already raised" in body
+    assert "- bugbot: double discount → **fixed** — @⁠x" in body
+    assert "json" not in body  # no empty Finding v1 payload

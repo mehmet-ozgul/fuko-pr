@@ -688,6 +688,33 @@ def test_observe_reviewer_health_persists_rows_locally(monkeypatch):
 
     assert ("o/r", "coderabbit", "none", 7) in seen
     assert ("o/r", "copilot", "none", 7) in seen
+    assert ("o/r", "bugbot", "none", 7) in seen
+
+
+def test_observe_reviewer_health_records_bugbot_from_its_check(monkeypatch):
+    """Bugbot's row on the health page comes from its check on HEAD."""
+    from sidecar import reviewer_health as rh
+    from sidecar.backends.base import PRRef
+
+    monkeypatch.delenv("FUKO_URL", raising=False)
+    monkeypatch.setattr(runner, "fetch_pr_head", lambda pr, token, api: "headsha")
+    monkeypatch.setattr(runner, "fetch_issue_comments", lambda pr, token, api: [])
+    monkeypatch.setattr(runner, "fetch_reviews", lambda pr, token, api: [])
+    check = {
+        "name": "Cursor Bugbot",
+        "app": {"slug": "cursor"},
+        "status": "completed",
+        "conclusion": "neutral",
+    }
+    monkeypatch.setattr(runner, "fetch_check_runs", lambda pr, ref, token, api: [check])
+    seen = {}
+    monkeypatch.setattr(
+        rh, "observe", lambda repo, rev, state, pr, detail: seen.update({rev: (state, detail)})
+    )
+
+    _REAL_OBSERVE(PRRef("o/r", 7, "u"), "tok", "https://api.github.com")
+
+    assert seen["bugbot"] == ("done", "check completed (neutral)")
 
 
 def test_observe_reviewer_health_swallows_fetch_errors(monkeypatch, capsys):

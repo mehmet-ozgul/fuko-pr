@@ -18,7 +18,7 @@ can:
   (Postgres or a sqlite-vec file in your own S3/R2 bucket) and survive switching
   the reviewer or the model underneath,
 - **read every reviewer's output as one schema** — `fuko signals` normalizes
-  PR-Agent, Copilot, and CodeRabbit findings into a single deterministic format.
+  PR-Agent, Copilot, CodeRabbit, and Cursor Bugbot findings into a single deterministic format.
 
 It's [Terraform](https://terraform.io) for review bots: a uniform config + a
 driver per backend, plus a portable knowledge base.
@@ -193,8 +193,8 @@ rebuilds the vector index automatically — no manual migration.
 `fuko signals --pr-url <url>` emits every reviewer's findings on a PR as one
 canonical JSON schema — **fuko Review Signal v1** — so a downstream
 "address-the-reviews" tool reads one shape instead of sniffing each vendor's
-markdown. PR-Agent declares severity/category; Copilot and CodeRabbit are detected
-by author and mapped best-effort (`severity_source` records which). See
+markdown. PR-Agent declares severity/category; Copilot, CodeRabbit and Cursor Bugbot are
+detected by author and mapped best-effort (`severity_source` records which). See
 [`docs/review-signal-v1.md`](docs/review-signal-v1.md).
 
 ## Optional: the knowledge sidecar

@@ -21,6 +21,18 @@ def _quiet_reviewer_health(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_peer_fetch(monkeypatch):
+    """Keep the agentic backend's already-raised fetch off the network.
+
+    Every backend test that reaches the prompt would otherwise call the GitHub
+    API for the PR's comments. Tests of that path re-patch it.
+    """
+    from sidecar.backends import agentic
+
+    monkeypatch.setattr(agentic, "fetch_peer_activity", lambda *a, **k: ([], []))
+
+
+@pytest.fixture(autouse=True)
 def _no_ambient_sidecar(monkeypatch):
     """Unset the sidecar env for every test, so no suite can reach a real one.
 

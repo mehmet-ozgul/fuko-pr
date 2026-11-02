@@ -702,7 +702,7 @@ def test_cmd_status_emits_json(monkeypatch, capsys):
     monkeypatch.setattr(cli, "_configured_seat_labels", lambda path: None)
     cli._cmd_status(argparse.Namespace(pr_url="https://github.com/o/r/pull/8", config=".fuko.toml"))
     out = {r["backend"]: r["state"] for r in json.loads(capsys.readouterr().out)}
-    assert out == {"coderabbit": "done", "copilot": "done"}
+    assert out == {"coderabbit": "done", "copilot": "done", "bugbot": "none"}
 
 
 def test_cmd_status_uses_check_run_to_gate_coderabbit(monkeypatch, capsys):
