@@ -29,7 +29,7 @@ def _no_peer_fetch(monkeypatch):
     """
     from sidecar.backends import agentic
 
-    monkeypatch.setattr(agentic, "fetch_peer_activity", lambda *a, **k: ([], []))
+    monkeypatch.setattr(agentic, "fetch_peer_activity", lambda *a, **k: ([], [], []))
 
 
 @pytest.fixture(autouse=True)

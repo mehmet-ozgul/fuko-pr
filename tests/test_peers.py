@@ -1,5 +1,7 @@
 """What other reviewers already raised, rendered for the prompt."""
 
+import httpx
+
 from sidecar.reviewer import peers
 from sidecar.signals import ReviewSignal, encode_marker
 
@@ -61,7 +63,77 @@ def test_a_persons_review_body_is_listed_and_a_bots_is_not():
         {"user": {"login": "cursor[bot]", "type": "Bot"}, "state": "COMMENTED", "body": "found 1"},
         {"user": randy, "state": "APPROVED", "body": ""},
     ]
-    assert peers.render_already_raised([], reviews) == "- [randy · review changes_requested] Fix X."
+    assert (
+        peers.render_already_raised([], reviews) == "- [randy · review changes_requested]\n  Fix X."
+    )
+
+
+def test_pr_comments_from_people_are_listed_with_their_lines():
+    review = {
+        "id": 20,
+        "user": {"login": "charlie", "type": "User"},
+        "body": (
+            "**Note: written by an AI reviewer.**\n\n\n\n"
+            "**Verdict:** approve\n\n### fast-follow — event PT"
+        ),
+    }
+    command = {"id": 21, "user": {"login": "randy", "type": "User"}, "body": "/ai-review"}
+    bot = {"id": 22, "user": {"login": "cursor[bot]", "type": "Bot"}, "body": "status"}
+    ours = {"id": 23, "user": {"login": "svc", "type": "User"}, "body": f"x\n{_fuko_marker()}"}
+    text = peers.render_already_raised([], [], [review, command, bot, ours])
+    assert text == (
+        "- [charlie · PR comment]\n"
+        "  **Note: written by an AI reviewer.**\n\n"
+        "  **Verdict:** approve\n\n"
+        "  ### fast-follow — event PT"
+    )
+
+
+def test_a_long_pr_comment_is_clipped(monkeypatch):
+    monkeypatch.setattr(peers, "MAX_LONG_TEXT", 50)
+    comment = {"id": 30, "user": {"login": "randy", "type": "User"}, "body": "y" * 200}
+    body = peers.render_already_raised([], [], [comment]).splitlines()[1]
+    assert body == "  " + "y" * 49 + "…"
+
+
+def _mock_github(monkeypatch, handler):
+    real = httpx.Client
+    monkeypatch.setattr(
+        peers.httpx, "Client", lambda **kw: real(transport=httpx.MockTransport(handler), **kw)
+    )
+
+
+def test_fetch_drops_pr_comments_from_the_posting_account(monkeypatch):
+    def handler(request):
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"id": 7, "login": "svc"})
+        if request.url.path.endswith("/issues/9/comments"):
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": 1, "user": {"id": 7, "login": "svc"}, "body": "Code Coverage Report"},
+                    {"id": 2, "user": {"id": 8, "login": "charlie"}, "body": "a review"},
+                ],
+            )
+        return httpx.Response(200, json=[])
+
+    _mock_github(monkeypatch, handler)
+    inline, reviews, issue = peers.fetch_peer_activity("o/r", 9, token="t", api_url="https://api.x")
+    assert (inline, reviews) == ([], [])
+    assert [c["id"] for c in issue] == [2]
+
+
+def test_fetch_keeps_pr_comments_when_the_posting_account_is_unknown(monkeypatch):
+    def handler(request):
+        if request.url.path == "/user":
+            return httpx.Response(403, json={"message": "Resource not accessible by integration"})
+        if request.url.path.endswith("/issues/9/comments"):
+            return httpx.Response(200, json=[{"id": 2, "user": {"id": 8}, "body": "a review"}])
+        return httpx.Response(200, json=[])
+
+    _mock_github(monkeypatch, handler)
+    _, _, issue = peers.fetch_peer_activity("o/r", 9, token="t", api_url="https://api.x")
+    assert [c["id"] for c in issue] == [2]
 
 
 def test_long_text_is_clipped_and_the_list_is_capped(monkeypatch):

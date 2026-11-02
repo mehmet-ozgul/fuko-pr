@@ -923,7 +923,7 @@ def test_invoke_puts_already_raised_findings_in_the_prompt(monkeypatch):
         "user": {"login": "randy", "type": "User"},
         "body": "This leaks the lock.",
     }
-    monkeypatch.setattr(agentic_mod, "fetch_peer_activity", lambda *a, **k: ([comment], []))
+    monkeypatch.setattr(agentic_mod, "fetch_peer_activity", lambda *a, **k: ([comment], [], []))
     _, captured = _invoke(monkeypatch, AgenticBackend(), HarnessResult(0, REVIEW_JSON))
     assert "<already-raised>\n- [randy] src/app.py:3 — This leaks the lock." in captured["prompt"]
 

@@ -65,11 +65,17 @@ of the failure sequence is in code it read). Nothing is executed, so nothing is
 called verified.
 
 **What other reviewers already raised.** Before the run, the backend fetches the
-PR's inline comments and reviews and renders an `<already-raised>` section
-(`sidecar/reviewer/peers.py`): CodeRabbit, Copilot, Cursor Bugbot and PR-Agent
-findings through their normalizers, plus top-level comments and review bodies
-from people. fuko's own comments are left out (the findings ledger carries
-them). The agent must not re-report any of them, and settles the ones its review
+PR's inline comments, reviews and PR comments and renders an `<already-raised>`
+section (`sidecar/reviewer/peers.py`): CodeRabbit, Copilot, Cursor Bugbot and
+PR-Agent findings through their normalizers, plus top-level comments, review
+bodies and PR comments from people. A review a teammate's AI assistant posted
+from their account is a PR comment, so it is settled like any other. Review
+bodies and PR comments keep their lines, up to 3000 characters each. fuko's own
+comments are left out (the findings ledger carries them), and so are commands
+such as `/ai-review` and every PR comment from the account fuko posts as (`GET
+/user`): behind a shared service user, that account also posts the CI reports.
+When fuko posts with a person's own token, that person's PR comments are left
+out too. The agent must not re-report any of them, and settles the ones its review
 touches in `already_raised` as `fixed`, `still_open` or `disputed`. The section
 is fenced and labelled as data, like the diff. A failed fetch drops the section
 and the review goes on.
