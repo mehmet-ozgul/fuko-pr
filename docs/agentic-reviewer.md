@@ -56,6 +56,24 @@ hunk), and `confidence`. Low-confidence findings are dropped before posting and
 counted in the review body ("N withheld"), so the agent has a pressure valve
 that is not "report it anyway".
 
+Each finding may also carry `failure_sequence` (the inputs and ordering that
+lead to the wrong behavior), `proposed_fix` (a diff, for critical and high),
+`verify_cmd` and `regression_test`. The prompt defines severity by what merging
+would cost (critical = blocking, high = fix before merge, medium = fast follow,
+low = nit) and confidence by how far reading established it (high = every step
+of the failure sequence is in code it read). Nothing is executed, so nothing is
+called verified.
+
+**What other reviewers already raised.** Before the run, the backend fetches the
+PR's inline comments and reviews and renders an `<already-raised>` section
+(`sidecar/reviewer/peers.py`): CodeRabbit, Copilot, Cursor Bugbot and PR-Agent
+findings through their normalizers, plus top-level comments and review bodies
+from people. fuko's own comments are left out (the findings ledger carries
+them). The agent must not re-report any of them, and settles the ones its review
+touches in `already_raised` as `fixed`, `still_open` or `disputed`. The section
+is fenced and labelled as data, like the diff. A failed fetch drops the section
+and the review goes on.
+
 ## Rounds remember: the open-findings ledger
 
 Measured on mepro, **86% of findings are one-shot** — reported once, never
@@ -1058,15 +1076,18 @@ The review body then has three parts:
    It is advisory: it neither approves nor blocks.
 2. **For people.**
    - The verdict and what was done: a read-only review of a named head, with
-     nothing built, run or tested.
-   - At most `human_findings` findings, most severe first, then most confident.
+     nothing built, run or tested. The verdict counts findings by Finding v1
+     severity (`blocking`, `fix-before-merge`, `fast-follow`, `nit`) and says
+     "needs changes" only when one is blocking. It never says "approve".
+   - At most `human_findings` findings, most severe first, then most confident,
+     each labelled `[severity/confidence]`. Nits never appear here.
      A finding that anchors to the diff is a one-line entry here, with its
      detail in the inline comment. One that doesn't anchor is shown here in
      full. No praise and no summary of the diff.
 3. **For the author's AI assistant**, collapsed in `<details>`: handling
-   instructions and every finding as Finding v1 JSON. Fields this reviewer's
-   output contract doesn't produce yet (`symbol`, `failure_sequence`,
-   `proposed_fix`) are absent rather than empty.
+   instructions, the round's verdicts on what other reviewers already raised,
+   and every finding as Finding v1 JSON. A field the model left empty, or one
+   the contract doesn't ask for (`symbol`), is absent rather than empty.
 
 Every finding still carries its invisible marker, the lower-ranked ones inside
 the collapsed section, so `fuko signals` recovers all of them. Model-written

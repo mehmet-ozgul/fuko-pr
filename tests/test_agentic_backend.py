@@ -916,6 +916,29 @@ def test_invoke_runs_outside_the_checkout(monkeypatch):
     assert "/tmp/nowhere" in captured["prompt"]  # the root is named in the prompt
 
 
+def test_invoke_puts_already_raised_findings_in_the_prompt(monkeypatch):
+    comment = {
+        "path": "src/app.py",
+        "line": 3,
+        "user": {"login": "randy", "type": "User"},
+        "body": "This leaks the lock.",
+    }
+    monkeypatch.setattr(agentic_mod, "fetch_peer_activity", lambda *a, **k: ([comment], []))
+    _, captured = _invoke(monkeypatch, AgenticBackend(), HarnessResult(0, REVIEW_JSON))
+    assert "<already-raised>\n- [randy] src/app.py:3 — This leaks the lock." in captured["prompt"]
+
+
+def test_invoke_reviews_without_the_section_when_the_fetch_fails(monkeypatch, capsys):
+    def boom(*a, **k):
+        raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(agentic_mod, "fetch_peer_activity", boom)
+    result, captured = _invoke(monkeypatch, AgenticBackend(), HarnessResult(0, REVIEW_JSON))
+    assert result.returncode == 0
+    assert "<already-raised>" not in captured["prompt"]
+    assert "already-raised section skipped" in capsys.readouterr().err
+
+
 def test_invoke_auth_failure_is_not_throttled(monkeypatch):
     """Failing over on bad credentials would burn every provider in the pool."""
     backend = AgenticBackend()
